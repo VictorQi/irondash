@@ -20,8 +20,8 @@ use crate::{
         kIOSurfaceBytesPerElement, kIOSurfaceBytesPerRow, kIOSurfaceHeight, kIOSurfacePixelFormat,
         kIOSurfaceWidth,
     },
-    BoxedIOSurface, BoxedPixelData, IOSurfaceProvider, PayloadProvider, PixelFormat,
-    PlatformTextureWithProvider, Result,
+    BoxedIOSurface, BoxedPixelData, Error, IOSurfaceProvider, PayloadPathContract, PayloadProvider,
+    PayloadTiming, PixelFormat, PlatformTextureWithProvider, Result, SurfaceCachePolicy,
 };
 use objc2::{
     declare_class, extern_class, extern_methods, msg_send_id, mutability, rc::Id,
@@ -30,6 +30,28 @@ use objc2::{
 
 use self::io_surface::{IOSurface, IOSurfaceGetHeight, IOSurfaceGetWidth, IOSurfaceRef};
 pub(crate) mod io_surface;
+
+// ============================================================================
+// F-02: Darwin Payload Path Contract Implementation
+// ============================================================================
+
+impl PayloadPathContract for BoxedIOSurface {
+    /// Darwin fetches payload via copyPixelBuffer on Raster Thread.
+    fn payload_timing() -> PayloadTiming {
+        PayloadTiming::PullDuringRaster
+    }
+}
+
+impl PayloadPathContract for BoxedPixelData {
+    /// Even PixelData on Darwin goes through SurfaceAdapter → copyPixelBuffer.
+    fn payload_timing() -> PayloadTiming {
+        PayloadTiming::PullDuringRaster
+    }
+}
+
+// ============================================================================
+// F-03: iOS SurfaceCache Policy Implementation
+// ============================================================================
 
 pub struct PlatformTexture<Type> {
     id: i64,
@@ -75,18 +97,55 @@ pub(crate) const PIXEL_DATA_FORMAT: PixelFormat = PixelFormat::BGRA;
 
 impl<Type> PlatformTexture<Type> {
     fn texture_registery(engine_handle: i64) -> Result<Id<FlutterTextureRegistry>> {
-        Ok(unsafe { Id::cast(EngineContext::get()?.get_texture_registry(engine_handle)?) })
+        EngineContext::get()
+            .map_err(|e| {
+                // EngineContext errors are already mapped to appropriate texture errors
+                Error::from(e)
+            })
+            .and_then(|ctx| {
+                ctx.get_texture_registry(engine_handle).map_err(|e| {
+                    match e {
+                        irondash_engine_context::Error::InvalidThread => Error::invalid_thread(),
+                        irondash_engine_context::Error::InvalidHandle => Error::invalid_handle(),
+                        _ => Error::from(e),
+                    }
+                })
+            })
+            .map(|registry| unsafe { Id::cast(registry) })
     }
 
+    // ========================================================================
+    // F-03: iOS SurfaceCache Ownership - Added policy parameter
+    // ========================================================================
     pub fn new(
         engine_handle: i64,
         provider: Arc<dyn PayloadProvider<BoxedIOSurface>>,
     ) -> Result<Self> {
+        Self::new_with_policy(engine_handle, provider, SurfaceCachePolicy::CacheWithReuse)
+    }
+
+    pub fn new_with_policy(
+        engine_handle: i64,
+        provider: Arc<dyn PayloadProvider<BoxedIOSurface>>,
+        policy: SurfaceCachePolicy,
+    ) -> Result<Self> {
         let update_requested = Arc::new(AtomicBool::new(false));
-        let provider = Arc::new(SurfaceCache::new(provider, update_requested.clone()));
+        let provider = Arc::new(SurfaceCache::new(provider, update_requested.clone(), policy));
         let texture_objc = IrondashTexture::new_with_provider(provider);
+
+        // Get texture registry
         let mut texture_registry = Self::texture_registery(engine_handle)?;
+
+        // Register texture and handle potential native failure
         let id: i64 = unsafe { texture_registry.registerTexture(&texture_objc) };
+
+        // F-01: Validate registration result
+        if id < 0 {
+            return Err(Error::native_registration_failed(Some(
+                "registerTexture: returned negative texture ID".into(),
+            )));
+        }
+
         Ok(Self {
             id,
             engine_handle,
@@ -96,9 +155,28 @@ impl<Type> PlatformTexture<Type> {
         })
     }
 
+    // ========================================================================
+    // F-05: Engine Teardown Helper - Silent unregister for teardown
+    // ========================================================================
     fn destroy(&mut self) -> Result<()> {
+        match Self::texture_registery(self.engine_handle) {
+            Ok(mut texture_registry) => {
+                // F-05: Silent unregister - don't fail if texture was already unregistered
+                unsafe { texture_registry.unregisterTexture(self.id) };
+                Ok(())
+            }
+            Err(_) => {
+                // Engine already destroyed; silent no-op
+                // This is expected during engine teardown
+                Ok(())
+            }
+        }
+    }
+
+    /// Explicit unregister with error reporting (for non-teardown scenarios)
+    pub fn unregister(&mut self) -> Result<()> {
         let mut texture_registry = Self::texture_registery(self.engine_handle)?;
-        unsafe { texture_registry.unregisterTexture(self.id) }
+        unsafe { texture_registry.unregisterTexture(self.id) };
         Ok(())
     }
 
@@ -152,37 +230,68 @@ impl IOSurfaceProvider for IOSurfaceHolder {
 /// 2. On iOS, which has a bug that requests the texture during every frame
 ///    regardless of mark_frame_available this reuses existing surface until next
 ///    call to mark_frame_available.
+///
+/// F-03: Added SurfaceCachePolicy to control ownership semantics.
+/// - CacheWithReuse: Original behavior (cache and clone)
+/// - NoCache: Fresh surface every time (clear ownership)
+/// - CacheNoClone: TODO - requires lifetime redesign
 struct SurfaceCache {
     surface: Mutex<Option<IOSurface>>,
     parent_provider: Arc<dyn PayloadProvider<BoxedIOSurface>>,
     update_requested: Arc<AtomicBool>,
+    policy: SurfaceCachePolicy,
 }
 
 impl SurfaceCache {
     fn new(
         parent_provider: Arc<dyn PayloadProvider<BoxedIOSurface>>,
         update_requested: Arc<AtomicBool>,
+        policy: SurfaceCachePolicy,
     ) -> Self {
         Self {
             surface: Mutex::new(None),
             parent_provider,
             update_requested,
+            policy,
         }
     }
 }
 
 impl PayloadProvider<BoxedIOSurface> for SurfaceCache {
     fn get_payload(&self) -> BoxedIOSurface {
-        let mut surface = self.surface.lock().unwrap();
-        if self.update_requested.load(Ordering::Acquire) {
-            surface.take();
-            self.update_requested.store(false, Ordering::Release);
+        match self.policy {
+            SurfaceCachePolicy::CacheWithReuse => {
+                // Original behavior: cache and clone
+                let mut surface = self.surface.lock().unwrap();
+                if self.update_requested.load(Ordering::Acquire) {
+                    surface.take();
+                    self.update_requested.store(false, Ordering::Release);
+                }
+                let surface = surface.get_or_insert_with(|| {
+                    self.parent_provider.get_payload().get().clone()
+                });
+                Box::new(IOSurfaceHolder {
+                    surface: surface.clone(),
+                })
+            }
+            SurfaceCachePolicy::NoCache => {
+                // Fresh surface every time: no caching, single clone
+                Box::new(IOSurfaceHolder {
+                    surface: self.parent_provider.get_payload().get().clone(),
+                })
+            }
+            SurfaceCachePolicy::CacheNoClone => {
+                // TODO: This requires lifetime redesign to return borrowed reference
+                // For now, fall back to NoCache behavior with a debug warning
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "SurfaceCachePolicy::CacheNoClone not yet implemented; using NoCache behavior"
+                );
+                Box::new(IOSurfaceHolder {
+                    surface: self.parent_provider.get_payload().get().clone(),
+                })
+            }
         }
-        let surface =
-            surface.get_or_insert_with(|| self.parent_provider.get_payload().get().clone());
-        Box::new(IOSurfaceHolder {
-            surface: surface.clone(),
-        })
     }
 }
 

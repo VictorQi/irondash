@@ -240,6 +240,96 @@ mod windows {
 #[cfg(target_os = "windows")]
 pub use windows::*;
 
+// ============================================================================
+// F-02: Android Payload Path Contract
+// ============================================================================
+// This trait allows higher-level code to reason about when get_payload()
+// will be called relative to mark_frame_available().
+//
+// See: code-base/IRONDASH_FORK_WORKBOOK.md §7 (F-02)
+
+/// Describes the payload fetch timing contract for a platform.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PayloadTiming {
+    /// Payload fetched during mark_frame_available() (Android current behavior)
+    PushDuringMarkAvailable,
+    /// Payload fetched later via callback (Darwin current behavior)
+    PullDuringRaster,
+    /// This payload type does not use get_payload() (e.g., NativeWindow direct access)
+    NotApplicable,
+}
+
+/// Trait for querying payload timing behavior.
+///
+/// # Example
+/// ```ignore
+/// use irondash_texture::{PayloadPathContract, PayloadTiming, BoxedPixelData};
+///
+/// let timing = <BoxedPixelData as PayloadPathContract>::payload_timing();
+/// match timing {
+///     PayloadTiming::PushDuringMarkAvailable => {
+///         // Android: prepare for Platform Thread payload fetch
+///     }
+///     PayloadTiming::PullDuringRaster => {
+///         // Darwin: prepare for Raster Thread payload fetch
+///     }
+///     _ => {}
+/// }
+/// ```
+pub trait PayloadPathContract {
+    /// Returns when get_payload() is called relative to mark_frame_available().
+    fn payload_timing() -> PayloadTiming;
+}
+
+// ============================================================================
+// F-03: iOS SurfaceCache Ownership Policy
+// ============================================================================
+// This enum allows higher-level code to control SurfaceCache behavior on Darwin.
+//
+// See: code-base/IRONDASH_FORK_WORKBOOK.md §7 (F-03)
+
+/// Controls how SurfaceCache manages IOSurface caching and ownership on Darwin.
+///
+/// # Policies
+/// - `CacheWithReuse`: Cache surfaces for reuse (default, backward compatible)
+/// - `NoCache`: Fresh surface every time (clear ownership, recommended for SharedSource)
+/// - `CacheNoClone`: Cache but return borrowed reference (requires lifetime redesign)
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum SurfaceCachePolicy {
+    /// Cache surfaces for reuse. May increment retain count on clone.
+    /// Use when performance is critical and retain count is managed externally.
+    #[default]
+    CacheWithReuse,
+
+    /// No caching. Fresh surface from provider every time.
+    /// Use when ownership clarity is critical (e.g., SharedSource model).
+    NoCache,
+
+    /// Cache but never clone. Return borrowed reference.
+    /// Use when caller manages lifetime explicitly.
+    /// Note: This variant requires lifetime redesign and is not yet implemented.
+    CacheNoClone,
+}
+
+// ============================================================================
+// F-04: Android Zero-Copy Extension Seam
+// ============================================================================
+// Re-export Android-specific zero-copy types when building for Android.
+//
+// See: code-base/IRONDASH_FORK_WORKBOOK.md §7 (F-04)
+
+#[cfg(target_os = "android")]
+mod android_zero_copy {
+    pub use crate::platform::android::{
+        AHardwareBufferHandle, AHardwareBufferProvider, DeferredPayloadFlush,
+    };
+}
+
+#[cfg(target_os = "android")]
+pub use android_zero_copy::*;
+
+// ============================================================================
+
 use crate::log::OkLog;
 
 /// SendableTexture is Send and Sync so it can be sent between threads, but it
