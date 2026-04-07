@@ -43,6 +43,16 @@ impl AHardwareBufferHandle {
         Self { buffer }
     }
 
+    /// Creates a new handle from a borrowed raw pointer by first acquiring an
+    /// extra AHardwareBuffer reference.
+    ///
+    /// # Safety
+    /// The pointer must remain valid for the duration of the acquire call.
+    pub unsafe fn from_borrowed_raw(buffer: *mut AHardwareBuffer) -> Self {
+        ndk_sys::AHardwareBuffer_acquire(buffer);
+        Self { buffer }
+    }
+
     /// Returns the raw pointer. Does not release ownership.
     pub fn as_raw(&self) -> *mut AHardwareBuffer {
         self.buffer
@@ -143,10 +153,65 @@ pub trait DeferredPayloadFlush {
     fn flush_payload(&self) -> Result<()>;
 }
 
+/// Identifies how a zero-copy source reaches the Android hardware buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AndroidHardwareBufferSourceKind {
+    /// Source owns a direct AHardwareBuffer handle.
+    AHardwareBuffer,
+    /// Source reaches the hardware buffer through an EGL image wrapper.
+    EglImageBackingBuffer,
+}
+
+/// Explicit Android zero-copy seam input for texture registration.
+#[derive(Clone)]
+pub struct AndroidHardwareBufferTextureSource {
+    provider: Arc<dyn AHardwareBufferProvider>,
+    source_kind: AndroidHardwareBufferSourceKind,
+    width: i32,
+    height: i32,
+}
+
+impl AndroidHardwareBufferTextureSource {
+    /// Creates a new hardware-buffer-backed registration source.
+    pub fn new(
+        provider: Arc<dyn AHardwareBufferProvider>,
+        source_kind: AndroidHardwareBufferSourceKind,
+        width: i32,
+        height: i32,
+    ) -> Self {
+        Self {
+            provider,
+            source_kind,
+            width,
+            height,
+        }
+    }
+
+    /// Returns the retained provider.
+    pub fn provider(&self) -> &Arc<dyn AHardwareBufferProvider> {
+        &self.provider
+    }
+
+    /// Returns how this source maps to an AHardwareBuffer.
+    pub fn source_kind(&self) -> AndroidHardwareBufferSourceKind {
+        self.source_kind
+    }
+
+    /// Returns the visible width in pixels.
+    pub fn width(&self) -> i32 {
+        self.width
+    }
+
+    /// Returns the visible height in pixels.
+    pub fn height(&self) -> i32 {
+        self.height
+    }
+}
+
 // ============================================================================
 
 use crate::{
-    log::OkLog, BoxedPixelData, PayloadPathContract, PayloadProvider, PayloadTiming,
+    log::OkLog, BoxedPixelData, Error, PayloadPathContract, PayloadProvider, PayloadTiming,
     PixelFormat, PlatformTextureWithProvider, PlatformTextureWithoutProvider, Result,
 };
 
@@ -192,6 +257,7 @@ pub struct PlatformTexture<Type> {
     native_window: *mut ANativeWindow,
     last_geometry: RefCell<Option<Geometry>>,
     pixel_data_provider: Option<Arc<dyn PayloadProvider<BoxedPixelData>>>,
+    hardware_buffer_source: Option<AndroidHardwareBufferTextureSource>,
     _phantom: PhantomData<Type>,
 }
 
@@ -205,6 +271,7 @@ impl<Type> PlatformTexture<Type> {
     fn new(
         engine_handle: i64,
         pixel_buffer_provider: Option<Arc<dyn PayloadProvider<BoxedPixelData>>>,
+        hardware_buffer_source: Option<AndroidHardwareBufferTextureSource>,
     ) -> Result<Self> {
         let java_vm = EngineContext::get_java_vm().map_err(|e| {
             match e {
@@ -276,6 +343,7 @@ impl<Type> PlatformTexture<Type> {
             native_window,
             last_geometry: RefCell::new(None),
             pixel_data_provider: pixel_buffer_provider,
+            hardware_buffer_source,
             _phantom: PhantomData {},
         };
         unsafe {
@@ -320,6 +388,15 @@ impl<Type> PlatformTexture<Type> {
     }
 
     pub fn mark_frame_available(&self) -> Result<()> {
+        if let Some(source) = self.hardware_buffer_source.as_ref() {
+            return Err(Error::texture_operation_failed(format!(
+                "Android zero-copy seam is registered for {:?} ({}x{}), but the flush path is not wired yet",
+                source.source_kind(),
+                source.width(),
+                source.height()
+            )));
+        }
+
         if let Some(provider) = self.pixel_data_provider.as_ref() {
             let payload = provider.get_payload();
             let payload = payload.get();
@@ -385,7 +462,16 @@ impl PlatformTextureWithProvider for BoxedPixelData {
         engine_handle: i64,
         payload_provider: Arc<dyn PayloadProvider<Self>>,
     ) -> Result<PlatformTexture<BoxedPixelData>> {
-        PlatformTexture::new(engine_handle, Some(payload_provider))
+        PlatformTexture::new(engine_handle, Some(payload_provider), None)
+    }
+}
+
+impl PlatformTexture<NativeWindow> {
+    pub fn new_with_hardware_buffer_source(
+        engine_handle: i64,
+        source: AndroidHardwareBufferTextureSource,
+    ) -> Result<PlatformTexture<NativeWindow>> {
+        PlatformTexture::new(engine_handle, None, Some(source))
     }
 }
 
@@ -420,7 +506,7 @@ impl Drop for NativeWindow {
 
 impl PlatformTextureWithoutProvider for NativeWindow {
     fn create_texture(engine_handle: i64) -> Result<PlatformTexture<NativeWindow>> {
-        PlatformTexture::new(engine_handle, None)
+        PlatformTexture::new(engine_handle, None, None)
     }
 
     fn get(texture: &PlatformTexture<Self>) -> Self {
@@ -432,7 +518,7 @@ pub struct Surface(pub GlobalRef);
 
 impl PlatformTextureWithoutProvider for Surface {
     fn create_texture(engine_handle: i64) -> Result<PlatformTexture<Surface>> {
-        PlatformTexture::new(engine_handle, None)
+        PlatformTexture::new(engine_handle, None, None)
     }
 
     fn get(texture: &PlatformTexture<Self>) -> Self {

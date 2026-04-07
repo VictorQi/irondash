@@ -11,16 +11,13 @@ repository = "https://github.com/irondash/irondash"
 
 [dependencies]
 futures = { version = "0.3.17", default-features = false, features = ["std"] }
-irondash_engine_context = { version = "0.5.0" }
+irondash_engine_context = { path = "../engine_context/rust" }
 once_cell = "1.16.0"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 core-foundation = "0.9"
 objc2 = "0.5.0"
-objc2-foundation = { version = "0.2.2", features = [
-    "NSString",
-    "NSThread",
-] }
+objc2-foundation = { version = "0.2.2", features = ["NSString", "NSThread"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { version = "0.2.2", features = [

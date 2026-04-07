@@ -87,6 +87,27 @@ impl<Type: PlatformTextureWithProvider> Texture<Type> {
     }
 }
 
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+impl Texture<BoxedIOSurface> {
+    /// Creates a new Darwin texture with an explicit IOSurface cache policy.
+    ///
+    /// This keeps `new_with_provider` backward compatible while allowing
+    /// SharedSource-backed paths to opt out of irondash surface caching.
+    pub fn new_with_provider_and_policy(
+        engine_handle: i64,
+        payload_provider: Arc<dyn PayloadProvider<BoxedIOSurface>>,
+        policy: SurfaceCachePolicy,
+    ) -> Result<Self> {
+        Ok(Self {
+            platform_texture: PlatformTexture::<BoxedIOSurface>::new_with_policy(
+                engine_handle,
+                payload_provider,
+                policy,
+            )?,
+        })
+    }
+}
+
 impl<Type: PlatformTextureWithoutProvider> Texture<Type> {
     /// Creates new texture for given engine without payload. This is used on
     /// Android where instead of providing payload to the texture,
@@ -104,6 +125,26 @@ impl<Type: PlatformTextureWithoutProvider> Texture<Type> {
 
     pub fn get(&self) -> Type {
         Type::get(&self.platform_texture)
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Texture<NativeWindow> {
+    /// Creates a new Android texture and retains a hardware-buffer-backed
+    /// zero-copy source for later explicit integration.
+    ///
+    /// The current fork only establishes the registration seam. Upload/flush
+    /// work is intentionally left to a later platform-specific implementation.
+    pub fn new_with_hardware_buffer_source(
+        engine_handle: i64,
+        source: AndroidHardwareBufferTextureSource,
+    ) -> Result<Self> {
+        Ok(Self {
+            platform_texture: PlatformTexture::<NativeWindow>::new_with_hardware_buffer_source(
+                engine_handle,
+                source,
+            )?,
+        })
     }
 }
 
@@ -126,7 +167,7 @@ impl PixelData<'_> {
 }
 
 pub trait PixelDataProvider {
-    fn get(&self) -> PixelData;
+    fn get(&self) -> PixelData<'_>;
 }
 
 /// Actual type for pixel buffer payload.
@@ -150,7 +191,7 @@ impl SimplePixelData {
 }
 
 impl PixelDataProvider for SimplePixelData {
-    fn get(&self) -> PixelData {
+    fn get(&self) -> PixelData<'_> {
         PixelData {
             width: self.width,
             height: self.height,
@@ -320,8 +361,9 @@ pub enum SurfaceCachePolicy {
 
 #[cfg(target_os = "android")]
 mod android_zero_copy {
-    pub use crate::platform::android::{
-        AHardwareBufferHandle, AHardwareBufferProvider, DeferredPayloadFlush,
+    pub use crate::platform::{
+        AHardwareBufferHandle, AHardwareBufferProvider, AndroidHardwareBufferSourceKind,
+        AndroidHardwareBufferTextureSource, DeferredPayloadFlush,
     };
 }
 
@@ -370,4 +412,27 @@ pub trait PlatformTextureWithoutProvider: Sized {
     fn create_texture(engine_handle: i64) -> Result<PlatformTexture<Self>>;
 
     fn get(texture: &PlatformTexture<Self>) -> Self;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn surface_cache_policy_default_remains_cache_with_reuse() {
+        assert_eq!(
+            SurfaceCachePolicy::default(),
+            SurfaceCachePolicy::CacheWithReuse
+        );
+    }
+
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    #[test]
+    fn darwin_policy_constructor_is_exposed() {
+        let _constructor: fn(
+            i64,
+            std::sync::Arc<dyn PayloadProvider<BoxedIOSurface>>,
+            SurfaceCachePolicy,
+        ) -> Result<Texture<BoxedIOSurface>> = Texture::<BoxedIOSurface>::new_with_provider_and_policy;
+    }
 }

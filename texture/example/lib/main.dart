@@ -6,147 +6,219 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:irondash_engine_context/irondash_engine_context.dart';
 
-Future<int?> initNative() async {
-  final dylib = defaultTargetPlatform == TargetPlatform.android
-      ? DynamicLibrary.open("libtexture_example.so")
+DynamicLibrary _loadLibrary() {
+  return defaultTargetPlatform == TargetPlatform.android
+      ? DynamicLibrary.open('libtexture_example.so')
       : (defaultTargetPlatform == TargetPlatform.windows
-          ? DynamicLibrary.open("texture_example.dll")
+          ? DynamicLibrary.open('texture_example.dll')
           : DynamicLibrary.process());
-
-  final initFunction = dylib
-      .lookup<NativeFunction<Void Function(Int64, Pointer<Void>, Int64)>>(
-          "init_texture_example")
-      .asFunction<void Function(int, Pointer<Void>, int)>();
-
-  final handle = await EngineContext.instance.getEngineHandle();
-  // init function is asynchronous, make sure to not block the thread while
-  // waiting for the result.
-  final port = ReceivePort();
-  initFunction(handle, NativeApi.initializeApiDLData, port.sendPort.nativePort);
-  return await port.first;
 }
 
-late int? texture;
+Future<int?> initNative(int engineHandle) async {
+  final dylib = _loadLibrary();
+  final initFunction = dylib
+      .lookup<NativeFunction<Void Function(Int64, Pointer<Void>, Int64)>>(
+        'init_texture_example',
+      )
+      .asFunction<void Function(int, Pointer<Void>, int)>();
 
-void main() async {
+  final port = ReceivePort();
+  initFunction(
+      engineHandle, NativeApi.initializeApiDLData, port.sendPort.nativePort);
+  return await port.first as int?;
+}
+
+Future<bool> releaseNative(int engineHandle) async {
+  final dylib = _loadLibrary();
+  final releaseFunction = dylib
+      .lookup<NativeFunction<Void Function(Int64, Pointer<Void>, Int64)>>(
+        'release_texture_example',
+      )
+      .asFunction<void Function(int, Pointer<Void>, int)>();
+
+  final port = ReceivePort();
+  releaseFunction(
+    engineHandle,
+    NativeApi.initializeApiDLData,
+    port.sendPort.nativePort,
+  );
+  return (await port.first) == 1;
+}
+
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  texture = await initNative();
   runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
+      title: 'Flutter Shared Texture Smoke',
       theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // Try running your application with "flutter run". You'll see the
-        // application has a blue toolbar. Then, without quitting the app, try
-        // changing the primarySwatch below to Colors.green and then invoke
-        // "hot reload" (press "r" in the console where you ran "flutter run",
-        // or simply save your changes to "hot reload" in a Flutter IDE).
-        // Notice that the counter didn't reset back to zero; the application
-        // is not restarted.
-        primarySwatch: Colors.blue,
+        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF00695C)),
+        useMaterial3: true,
       ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      home: const SmokeHomePage(),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+class SmokeHomePage extends StatefulWidget {
+  const SmokeHomePage({super.key});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<SmokeHomePage> createState() => _SmokeHomePageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _SmokeHomePageState extends State<SmokeHomePage> {
+  int? _engineHandle;
+  int? _textureId;
+  bool _busy = false;
+  String _status = '等待初始化';
 
-  void _incrementCounter() {
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_acquireTexture());
+  }
+
+  Future<void> _acquireTexture() async {
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      _busy = true;
+      _status = '正在通过 Rust ffi-api 主路径申请纹理';
     });
+
+    try {
+      final engineHandle =
+          _engineHandle ?? await EngineContext.instance.getEngineHandle();
+      final textureId = await initNative(engineHandle);
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _engineHandle = engineHandle;
+        _textureId = textureId;
+        _status = textureId == null
+            ? '申请失败，未拿到 texture_id'
+            : '纹理已就绪：ffi-api -> engine-texture-registry -> platform-android bridge';
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _status = '初始化失败: $error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _releaseTexture() async {
+    final engineHandle = _engineHandle;
+    if (engineHandle == null) {
+      return;
+    }
+
+    setState(() {
+      _busy = true;
+      _status = '正在释放 SharedSource 与 engine-local texture';
+    });
+
+    try {
+      final released = await releaseNative(engineHandle);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _textureId = null;
+        _status = released ? '已请求释放纹理与共享源' : '当前没有可释放的活动会话';
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _status = '释放失败: $error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+        });
+      }
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
+    final preview = _textureId == null
+        ? const Center(
+            child: Text(
+              '当前没有活动纹理',
+              textAlign: TextAlign.center,
+            ),
+          )
+        : Texture(textureId: _textureId!);
+
     return Scaffold(
       appBar: AppBar(
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
+        title: const Text('Android Smoke Host'),
       ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Invoke "debug painting" (press "p" in the console, choose the
-          // "Toggle Debug Paint" action from the Flutter Inspector in Android
-          // Studio, or the "Toggle Debug Paint" command in Visual Studio Code)
-          // to see the wireframe for each widget.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const Text(
-              'You have pushed the button this many times:',
+      body: ListView(
+        padding: const EdgeInsets.all(20),
+        children: [
+          Text(
+            '这个宿主复用 irondash/texture/example，并在 Android 上改走 fluttersharedtexture 的 Rust 主路径。',
+            style: Theme.of(context).textTheme.bodyLarge,
+          ),
+          const SizedBox(height: 16),
+          Text('状态: $_status'),
+          const SizedBox(height: 8),
+          Text('Engine handle: ${_engineHandle ?? '-'}'),
+          const SizedBox(height: 4),
+          Text('Texture id: ${_textureId ?? '-'}'),
+          const SizedBox(height: 20),
+          Container(
+            height: 280,
+            clipBehavior: Clip.antiAlias,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(24),
+              border: Border.all(
+                  color: Theme.of(context).colorScheme.outlineVariant),
+              color: Theme.of(context).colorScheme.surfaceContainerHighest,
             ),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
-            ),
-            const CircularProgressIndicator(),
-            SizedBox.square(
-              dimension: 200,
-              child: texture != null
-                  ? Texture(textureId: texture!)
-                  : const Text('Failed to initialize texture'),
-            ),
-          ],
-        ),
+            child: preview,
+          ),
+          const SizedBox(height: 20),
+          Wrap(
+            spacing: 12,
+            runSpacing: 12,
+            children: [
+              FilledButton(
+                onPressed: _busy ? null : _acquireTexture,
+                child: Text(_busy ? '处理中...' : 'Acquire Smoke Texture'),
+              ),
+              OutlinedButton(
+                onPressed: _busy || _textureId == null ? null : _releaseTexture,
+                child: const Text('Release Texture'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          const Text(
+            '通过标准：看到预览区域出现彩色条纹/棋盘图案；释放后区域清空；再次 acquire 可重新出现新纹理。',
+          ),
+        ],
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
     );
   }
 }
