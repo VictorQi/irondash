@@ -1,9 +1,10 @@
-use std::{cell::RefCell, marker::PhantomData, slice, sync::Arc};
+use std::{cell::RefCell, cmp::min, marker::PhantomData, slice, sync::Arc};
 
 use irondash_engine_context::EngineContext;
 use jni::objects::{GlobalRef, JObject};
 use ndk_sys::{
     AHardwareBuffer, AHardwareBuffer_Format, AHardwareBuffer_Desc,
+    AHardwareBuffer_UsageFlags,
     ANativeWindow, ANativeWindow_Buffer, ANativeWindow_acquire,
     ANativeWindow_fromSurface, ANativeWindow_lock, ANativeWindow_release,
     ANativeWindow_setBuffersGeometry, ANativeWindow_unlockAndPost,
@@ -250,6 +251,8 @@ struct Geometry {
     format: i32,
 }
 
+const BYTES_PER_PIXEL: usize = 4;
+
 pub struct PlatformTexture<Type> {
     id: i64,
     texture_entry: GlobalRef,
@@ -389,12 +392,8 @@ impl<Type> PlatformTexture<Type> {
 
     pub fn mark_frame_available(&self) -> Result<()> {
         if let Some(source) = self.hardware_buffer_source.as_ref() {
-            return Err(Error::texture_operation_failed(format!(
-                "Android zero-copy seam is registered for {:?} ({}x{}), but the flush path is not wired yet",
-                source.source_kind(),
-                source.width(),
-                source.height()
-            )));
+            self.flush_hardware_buffer_source(source)?;
+            return Ok(());
         }
 
         if let Some(provider) = self.pixel_data_provider.as_ref() {
@@ -405,18 +404,7 @@ impl<Type> PlatformTexture<Type> {
                 height: payload.height,
                 format: AHardwareBuffer_Format::AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM.0 as i32,
             };
-            let mut last_geometry = self.last_geometry.borrow_mut();
-            if *last_geometry != Some(geometry) {
-                unsafe {
-                    ANativeWindow_setBuffersGeometry(
-                        self.native_window,
-                        geometry.width,
-                        geometry.height,
-                        geometry.format,
-                    );
-                }
-                last_geometry.replace(geometry);
-            }
+            self.ensure_window_geometry(geometry)?;
             let mut buf: ANativeWindow_Buffer = unsafe { std::mem::zeroed() };
 
             let data = unsafe {
@@ -449,6 +437,242 @@ impl<Type> PlatformTexture<Type> {
         }
         Ok(())
     }
+
+    fn ensure_window_geometry(&self, geometry: Geometry) -> Result<()> {
+        let mut last_geometry = self.last_geometry.borrow_mut();
+        if *last_geometry == Some(geometry) {
+            return Ok(());
+        }
+
+        let status = unsafe {
+            ANativeWindow_setBuffersGeometry(
+                self.native_window,
+                geometry.width,
+                geometry.height,
+                geometry.format,
+            )
+        };
+        if status != 0 {
+            return Err(Error::texture_operation_failed(format!(
+                "ANativeWindow_setBuffersGeometry failed with status {status}"
+            )));
+        }
+
+        last_geometry.replace(geometry);
+        Ok(())
+    }
+
+    fn flush_hardware_buffer_source(
+        &self,
+        source: &AndroidHardwareBufferTextureSource,
+    ) -> Result<()> {
+        let buffer = source.provider().get_buffer();
+        let desc = unsafe { buffer.describe() };
+        let expected_format = AHardwareBuffer_Format::AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM.0;
+        if desc.format != expected_format as u32 {
+            return Err(Error::texture_operation_failed(format!(
+                "Android hardware-buffer flush currently supports only RGBA8888; got format {} for {:?}",
+                desc.format,
+                source.source_kind()
+            )));
+        }
+
+        let width = if source.width() > 0 {
+            source.width()
+        } else {
+            i32::try_from(desc.width).map_err(|_| {
+                Error::texture_operation_failed("AHardwareBuffer width exceeded i32")
+            })?
+        };
+        let height = if source.height() > 0 {
+            source.height()
+        } else {
+            i32::try_from(desc.height).map_err(|_| {
+                Error::texture_operation_failed("AHardwareBuffer height exceeded i32")
+            })?
+        };
+        let stride_pixels = i32::try_from(desc.stride).map_err(|_| {
+            Error::texture_operation_failed("AHardwareBuffer stride exceeded i32")
+        })?;
+
+        if width <= 0 || height <= 0 {
+            return Err(Error::texture_operation_failed(format!(
+                "Android hardware-buffer flush requires positive geometry; got {}x{}",
+                width, height
+            )));
+        }
+        if stride_pixels <= 0 || stride_pixels < width {
+            return Err(Error::texture_operation_failed(format!(
+                "Android hardware-buffer flush received invalid stride {} for width {}",
+                stride_pixels, width
+            )));
+        }
+
+        let geometry = Geometry {
+            width,
+            height,
+            format: expected_format as i32,
+        };
+        self.ensure_window_geometry(geometry)?;
+
+        let mut source_ptr = std::ptr::null_mut();
+        let source_lock_status = unsafe {
+            ndk_sys::AHardwareBuffer_lock(
+                buffer.as_raw(),
+                AHardwareBuffer_UsageFlags::AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN.0 as u64,
+                -1,
+                std::ptr::null(),
+                &mut source_ptr,
+            )
+        };
+        if source_lock_status != 0 {
+            return Err(Error::texture_operation_failed(format!(
+                "AHardwareBuffer_lock failed with status {source_lock_status}"
+            )));
+        }
+        if source_ptr.is_null() {
+            let _ = unlock_hardware_buffer(buffer.as_raw());
+            return Err(Error::texture_operation_failed(
+                "AHardwareBuffer_lock returned a null data pointer",
+            ));
+        }
+
+        let mut window_buffer = unsafe { std::mem::zeroed::<ANativeWindow_Buffer>() };
+        let window_lock_status = unsafe {
+            ANativeWindow_lock(self.native_window, &mut window_buffer, std::ptr::null_mut())
+        };
+        if window_lock_status != 0 {
+            let _ = unlock_hardware_buffer(buffer.as_raw());
+            return Err(Error::texture_operation_failed(format!(
+                "ANativeWindow_lock failed with status {window_lock_status}"
+            )));
+        }
+        if window_buffer.bits.is_null() {
+            let _ = unlock_hardware_buffer(buffer.as_raw());
+            let _ = unsafe { ANativeWindow_unlockAndPost(self.native_window) };
+            return Err(Error::texture_operation_failed(
+                "ANativeWindow_lock returned a null data pointer",
+            ));
+        }
+
+        let copy_result = copy_hardware_buffer_rows(
+            source_ptr.cast(),
+            width,
+            height,
+            stride_pixels,
+            &window_buffer,
+        );
+        let source_unlock_result = unlock_hardware_buffer(buffer.as_raw());
+        let window_unlock_status = unsafe { ANativeWindow_unlockAndPost(self.native_window) };
+
+        match copy_result {
+            Ok(()) => {
+                source_unlock_result?;
+                if window_unlock_status != 0 {
+                    return Err(Error::texture_operation_failed(format!(
+                        "ANativeWindow_unlockAndPost failed with status {window_unlock_status}"
+                    )));
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let _ = source_unlock_result;
+                let _ = window_unlock_status;
+                Err(error)
+            }
+        }
+    }
+}
+
+fn area_bytes(height: i32, stride_pixels: i32, label: &str) -> Result<usize> {
+    let height = usize::try_from(height)
+        .map_err(|_| Error::texture_operation_failed(format!("{label} height was negative")))?;
+    let stride_pixels = usize::try_from(stride_pixels).map_err(|_| {
+        Error::texture_operation_failed(format!("{label} stride was negative"))
+    })?;
+
+    height
+        .checked_mul(stride_pixels)
+        .and_then(|area| area.checked_mul(BYTES_PER_PIXEL))
+        .ok_or_else(|| {
+            Error::texture_operation_failed(format!(
+                "{label} buffer size overflowed while preparing Android hardware-buffer flush"
+            ))
+        })
+}
+
+fn copy_hardware_buffer_rows(
+    source_ptr: *const u8,
+    width: i32,
+    height: i32,
+    source_stride_pixels: i32,
+    window_buffer: &ANativeWindow_Buffer,
+) -> Result<()> {
+    if window_buffer.height <= 0 || window_buffer.stride <= 0 {
+        return Err(Error::texture_operation_failed(format!(
+            "Android destination geometry was invalid: height={}, stride={}",
+            window_buffer.height,
+            window_buffer.stride
+        )));
+    }
+
+    let source_byte_len = area_bytes(height, source_stride_pixels, "source")?;
+    let destination_byte_len = area_bytes(window_buffer.height, window_buffer.stride, "destination")?;
+    let rows = min(height, window_buffer.height);
+    let visible_bytes_per_row = usize::try_from(width)
+        .ok()
+        .and_then(|visible_width| visible_width.checked_mul(BYTES_PER_PIXEL))
+        .ok_or_else(|| Error::texture_operation_failed("visible row byte count overflowed"))?;
+    let source_stride_bytes = usize::try_from(source_stride_pixels)
+        .ok()
+        .and_then(|stride| stride.checked_mul(BYTES_PER_PIXEL))
+        .ok_or_else(|| Error::texture_operation_failed("source stride byte count overflowed"))?;
+    let destination_stride_bytes = usize::try_from(window_buffer.stride)
+        .ok()
+        .and_then(|stride| stride.checked_mul(BYTES_PER_PIXEL))
+        .ok_or_else(|| Error::texture_operation_failed("destination stride byte count overflowed"))?;
+    let row_copy_bytes = min(
+        visible_bytes_per_row,
+        min(source_stride_bytes, destination_stride_bytes),
+    );
+
+    let source_data = unsafe { slice::from_raw_parts(source_ptr, source_byte_len) };
+    let destination_data = unsafe {
+        slice::from_raw_parts_mut(window_buffer.bits.cast::<u8>(), destination_byte_len)
+    };
+
+    for row in 0..usize::try_from(rows)
+        .map_err(|_| Error::texture_operation_failed("destination row count was negative"))?
+    {
+        let source_offset = row
+            .checked_mul(source_stride_bytes)
+            .ok_or_else(|| Error::texture_operation_failed("source row offset overflowed"))?;
+        let destination_offset = row
+            .checked_mul(destination_stride_bytes)
+            .ok_or_else(|| Error::texture_operation_failed("destination row offset overflowed"))?;
+        let source_end = source_offset
+            .checked_add(row_copy_bytes)
+            .ok_or_else(|| Error::texture_operation_failed("source row copy range overflowed"))?;
+        let destination_end = destination_offset
+            .checked_add(row_copy_bytes)
+            .ok_or_else(|| Error::texture_operation_failed("destination row copy range overflowed"))?;
+
+        destination_data[destination_offset..destination_end]
+            .copy_from_slice(&source_data[source_offset..source_end]);
+    }
+
+    Ok(())
+}
+
+fn unlock_hardware_buffer(buffer: *mut AHardwareBuffer) -> Result<()> {
+    let mut release_fence = -1;
+    let status = unsafe { ndk_sys::AHardwareBuffer_unlock(buffer, &mut release_fence) };
+    if status != 0 {
+        return Err(Error::texture_operation_failed(format!(
+            "AHardwareBuffer_unlock failed with status {status}"
+        )));
+    }
+    Ok(())
 }
 
 impl<Type> Drop for PlatformTexture<Type> {
@@ -472,6 +696,18 @@ impl PlatformTexture<NativeWindow> {
         source: AndroidHardwareBufferTextureSource,
     ) -> Result<PlatformTexture<NativeWindow>> {
         PlatformTexture::new(engine_handle, None, Some(source))
+    }
+}
+
+impl DeferredPayloadFlush for PlatformTexture<NativeWindow> {
+    fn flush_payload(&self) -> Result<()> {
+        let source = self.hardware_buffer_source.as_ref().ok_or_else(|| {
+            Error::texture_operation_failed(
+                "explicit hardware-buffer flush requires a registered hardware-buffer source",
+            )
+        })?;
+
+        self.flush_hardware_buffer_source(source)
     }
 }
 

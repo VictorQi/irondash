@@ -9,6 +9,12 @@ android {
     compileSdk flutter.compileSdkVersion
     ndkVersion flutter.ndkVersion
 
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
@@ -19,7 +25,14 @@ android {
     }
 
     sourceSets {
-        main.java.srcDirs += 'src/main/kotlin'
+        main {
+            java.srcDirs += 'src/main/kotlin'
+            jniLibs.srcDirs += [
+                "$buildDir/jniLibs/debug",
+                "$buildDir/jniLibs/profile",
+                "$buildDir/jniLibs/release",
+            ]
+        }
     }
 
     defaultConfig {

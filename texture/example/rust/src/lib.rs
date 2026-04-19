@@ -100,6 +100,14 @@ mod android_smoke {
             engine_handle,
             FfiPriorityCode::Visible as u32,
         );
+        debug!(
+            "Smoke acquire response: decision={}, request_id={}, status={}, texture_id={}, error_code={}",
+            response.decision,
+            response.request_id,
+            response.status,
+            response.texture_id,
+            response.error_code
+        );
         if response.decision == FfiAcquireDecision::Rejected as u32 {
             return Err(format!(
                 "acquire_shared_texture rejected with error_code={}",
@@ -118,10 +126,12 @@ mod android_smoke {
         }
 
         let processed = irondash_ffi_process_pending_requests(1);
+        log_request_state("after acquire submit", response.request_id);
         debug!(
             "Smoke request pumped on platform thread: request_id={}, processed={}",
             response.request_id, processed
         );
+        log_request_state("after process_pending_requests", response.request_id);
 
         let texture_id = find_texture_id(response.request_id).ok_or_else(|| {
             format!(
@@ -156,6 +166,7 @@ mod android_smoke {
                 session.request_id, release.error_code
             ));
         }
+        log_request_state("after release_texture", session.request_id);
 
         let unregister = irondash_ffi_unregister_engine(session.engine_handle);
         if !unregister.success && unregister.error_code != 0 {
@@ -224,6 +235,7 @@ mod android_smoke {
                 session.request_id, release.error_code
             );
         }
+        log_request_state("after best-effort release", session.request_id);
 
         let unregister = irondash_ffi_unregister_engine(session.engine_handle);
         if !unregister.success && unregister.error_code != 0 {
@@ -248,6 +260,20 @@ mod android_smoke {
         }
 
         None
+    }
+
+    fn log_request_state(stage: &str, request_id: u64) {
+        let mut state = FfiRequestStateSnapshot::default();
+        let found = irondash_ffi_get_request_state(request_id, &mut state as *mut _);
+        debug!(
+            "Smoke request state {}: request_id={}, found={}, status={}, texture_id={}, error_code={}",
+            stage,
+            request_id,
+            found,
+            state.status,
+            state.texture_id,
+            state.error_code
+        );
     }
 
     fn drain_events(request_id: u64) -> Option<i64> {

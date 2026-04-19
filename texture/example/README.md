@@ -35,12 +35,50 @@ flutter pub get
 flutter run -d <android-device-id>
 ```
 
+在当前这台机器上，已经验证过的推荐启动方式是：
+
+```sh
+source "$HOME/.zprofile"
+source "$HOME/.zshrc"
+proxy
+export JAVA_HOME=$(/usr/libexec/java_home -v 17)
+/Users/victor/fvm/versions/stable/bin/flutter run -d <android-device-id> --use-application-binary build/app/outputs/flutter-apk/app-debug.apk
+```
+
+原因：
+
+- 这样可以直接复用已验证 APK，避免每次继续工作都重新卡在 Gradle/cargokit 构建链
+- 本次会话结束前已经关闭 adb server，因此下次需要先执行 `adb start-server && adb devices`
+
+如果改动触及 Rust host / JNI 打包链，先重建 APK：
+
+```sh
+source "$HOME/.zprofile"
+source "$HOME/.zshrc"
+proxy
+export JAVA_HOME=$(/usr/libexec/java_home -v 17)
+/Users/victor/fvm/versions/stable/bin/flutter clean
+/Users/victor/fvm/versions/stable/bin/flutter build apk --debug --android-skip-build-dependency-validation
+```
+
 可选设备：
 
 - Android Studio 模拟器
 - adb 连接的真机
 
 两者都可以，只要是 Android 26+ 且 Flutter 能正常运行。
+
+最近一次已验证环境：
+
+- 设备：Xiaomi 15 Ultra
+- 日期：2026-04-20
+- 结果：冷启动自动 acquire 成功显示纹理；`Release Texture` 后预览区清空；再次 `Acquire Smoke Texture` 后生成新的 `request_id=1` / `texture_id=1`，纹理重新出现
+
+下期继续时建议先做：
+
+1. `adb start-server && adb devices`
+2. 用 `--use-application-binary` 启动已验证 APK 重放基线
+3. 只有在 host / Rust / JNI 链改动后才重新 `flutter clean && flutter build apk`
 
 ## 手动验收
 

@@ -131,10 +131,11 @@ impl<Type: PlatformTextureWithoutProvider> Texture<Type> {
 #[cfg(target_os = "android")]
 impl Texture<NativeWindow> {
     /// Creates a new Android texture and retains a hardware-buffer-backed
-    /// zero-copy source for later explicit integration.
+    /// source for hardware-buffer-backed frame delivery.
     ///
-    /// The current fork only establishes the registration seam. Upload/flush
-    /// work is intentionally left to a later platform-specific implementation.
+    /// `mark_frame_available()` will flush the retained hardware-buffer source
+    /// into the engine-local texture on the Platform Thread. Callers that want
+    /// explicit control can also use `DeferredPayloadFlush::flush_payload()`.
     pub fn new_with_hardware_buffer_source(
         engine_handle: i64,
         source: AndroidHardwareBufferTextureSource,
@@ -145,6 +146,13 @@ impl Texture<NativeWindow> {
                 source,
             )?,
         })
+    }
+}
+
+#[cfg(target_os = "android")]
+impl DeferredPayloadFlush for Texture<NativeWindow> {
+    fn flush_payload(&self) -> Result<()> {
+        self.platform_texture.flush_payload()
     }
 }
 
