@@ -6,12 +6,14 @@ Android 路径会走：
 
 - Flutter host
 - example Rust glue
-- ffi-api
-- engine-texture-registry
-- Android native-window texture
-- platform-android bridge
+- ffi-api（当前 smoke host 显式启用 `AndroidTextureRegistrationStrategy::ZeroCopySeam`）
+- engine-texture-registry（`AndroidZeroCopy` request）
+- irondash `Texture::new_with_hardware_buffer_source()`
+- `mark_frame_available()` / `DeferredPayloadFlush` 对应的 hardware-buffer delivery 路径
 
 其中共享源会在 Rust glue 里创建一个最小 RGBA8888 AHardwareBuffer，并挂上 AndroidPlatformCleaner，供 SharedSource 持有和释放。
+
+注意：`platform-android::AndroidFrameBridge` 仍然保留为默认 CPU-copy fallback/baseline，但当前 smoke host 这轮验证优先走的是显式 AndroidHardwareBuffer 注册路径，不再是旧的默认 bridge 路径。
 
 ## 目录
 
@@ -71,8 +73,11 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 最近一次已验证环境：
 
 - 设备：Xiaomi 15 Ultra
-- 日期：2026-04-20
-- 结果：冷启动自动 acquire 成功显示纹理；`Release Texture` 后预览区清空；再次 `Acquire Smoke Texture` 后生成新的 `request_id=1` / `texture_id=1`，纹理重新出现
+- 日期：2026-04-23
+- 结果：clean rebuild 后复用新的 `app-debug.apk` 通过 `flutter run --use-application-binary` 完成真机 smoke；冷启动自动 acquire 成功显示纹理并拿到 `request_id=0` / `texture_id=0`；`Release Texture` 后 UI 进入“当前没有活动纹理”，并且没有立即出现 `EngineGone`；再次 `Acquire Smoke Texture` 时，smoke host 会先消费保留下来的待清理 session，执行 best-effort `unregister_engine`，随后重新 `register_engine` 并拿到新的 `request_id=1` / `texture_id=1`
+- 增强日志确认：当前 smoke host 创建了真实 `AHardwareBuffer`（`256x256`），冷启动和 reacquire 都直接走到 `TextureReady -> Ready`，而没有再出现 `FFI Android delivery attempting bridge` / `AndroidFrameBridge copy start` 这一类默认 CPU-copy bridge 日志
+- UI 回归也确认：reacquire 后页面重新显示“纹理已就绪”，并更新到 `Texture id: 1`
+- 语义澄清：当前这条链已经收口了“显式 AndroidHardwareBuffer 注册主路径”，但如果把“真实 zero-copy”定义成“最终不发生 `AHardwareBuffer -> ANativeWindow` 的复制”，这仍不是终态
 
 下期继续时建议先做：
 
@@ -94,5 +99,8 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 ## 当前限制
 
 - 这是最小 smoke host，不包含 Dart plugin 包装，也不提供通用业务 API。
-- Android 主路径当前验证的是 `ffi-api -> registry -> platform-android bridge` 的单纹理冒烟，不是完整产品化多 source 场景。
-- `Release Texture` 触发的是真实 Rust release path；原生清理由 SharedSource 的 deferred cleanup 异步投递到 Platform Thread 执行。
+- 当前 smoke host 验证的是 `ffi-api -> engine-texture-registry -> irondash hardware-buffer path` 的单纹理冒烟，不是完整产品化多 source 场景。
+- `Release Texture` 现在只走真实 Rust `release_texture` 路径，用于单独验证 release 语义；smoke host 会保留一份待清理 session，用于下一次 acquire 前执行 best-effort `unregister_engine`。
+- 因此，release 后如果日志里没有紧跟 `EngineGone`，这是新的宿主预期；只有显式 reacquire 触发 best-effort teardown 时，才应该看到由 `unregister_engine` 带来的 engine-level 事件。
+- 随后的 `Acquire Smoke Texture` 会先消费这份待清理 session，再重新执行 `register_engine` 发起 acquire；这样 release 语义和 engine teardown 语义在 smoke host 里是分开的，但重新获取纹理仍然可用。
+- 需要特别注意：irondash 当前的 Android hardware-buffer 实现仍会在 `mark_frame_available()` 期间把 retained `AHardwareBuffer` flush 到 engine-local `ANativeWindow`。因此“显式 AndroidHardwareBuffer 主路径已接通”不等于“GPU-direct / 无 copy 的最终 zero-copy 已完成”。

@@ -25,6 +25,7 @@ mod android_smoke {
         replace_global_api,
         FfiAcquireDecision,
         FfiApi,
+        AndroidTextureRegistrationStrategy,
         FfiEvent,
         FfiEventRecord,
         FfiEventType,
@@ -51,10 +52,12 @@ mod android_smoke {
     static SMOKE_RUNTIME: OnceLock<Arc<FfiApi>> = OnceLock::new();
     static SMOKE_SESSION: OnceLock<Mutex<Option<SmokeSession>>> = OnceLock::new();
 
+    #[derive(Clone, Copy)]
     struct SmokeSession {
         engine_handle: i64,
         request_id: u64,
         texture_id: i64,
+        released: bool,
     }
 
     struct AndroidSmokeSourceProvider {
@@ -85,6 +88,7 @@ mod android_smoke {
 
     pub fn acquire_texture(engine_handle: i64) -> Result<i64, String> {
         let _runtime = ensure_runtime();
+        info!("Smoke acquire start: engine_handle={}", engine_handle);
         release_existing_session();
 
         let register = irondash_ffi_register_engine(engine_handle);
@@ -94,6 +98,13 @@ mod android_smoke {
                 engine_handle, register.error_code
             ));
         }
+        debug!(
+            "Smoke register_engine completed: engine_handle={}, success={}, is_registered={}, error_code={}",
+            engine_handle,
+            register.success,
+            register.is_registered,
+            register.error_code
+        );
 
         let response = irondash_ffi_acquire_shared_texture(
             SMOKE_SOURCE_ID,
@@ -150,14 +161,27 @@ mod android_smoke {
 
     pub fn release_texture(_engine_handle: i64) -> Result<bool, String> {
         let _runtime = ensure_runtime();
-        let session = {
-            let mut guard = smoke_session().lock().expect("smoke session mutex poisoned");
-            guard.take()
-        };
-
-        let Some(session) = session else {
+        let mut guard = smoke_session().lock().expect("smoke session mutex poisoned");
+        let Some(session) = guard.as_ref().copied() else {
             return Ok(false);
         };
+
+        if session.released {
+            info!(
+                "Smoke release skipped: request already released, pending engine teardown remains for reacquire: engine_handle={}, request_id={}, texture_id={}",
+                session.engine_handle,
+                session.request_id,
+                session.texture_id
+            );
+            return Ok(false);
+        }
+
+        info!(
+            "Smoke release start: engine_handle={}, request_id={}, texture_id={}",
+            session.engine_handle,
+            session.request_id,
+            session.texture_id
+        );
 
         let release = irondash_ffi_release_texture(session.request_id, session.engine_handle);
         if release.error_code != 0 {
@@ -167,19 +191,25 @@ mod android_smoke {
             ));
         }
         log_request_state("after release_texture", session.request_id);
-
-        let unregister = irondash_ffi_unregister_engine(session.engine_handle);
-        if !unregister.success && unregister.error_code != 0 {
-            return Err(format!(
-                "unregister_engine failed for handle {} with error_code={}",
-                session.engine_handle, unregister.error_code
-            ));
+        debug!(
+            "Smoke release result: request_id={}, texture_id={}, release_disposition={}, error_code={}",
+            session.request_id,
+            session.texture_id,
+            release.release_disposition,
+            release.error_code
+        );
+        if let Some(stored) = guard.as_mut() {
+            stored.released = true;
         }
+        drop(guard);
 
         drain_events(session.request_id);
         info!(
-            "Smoke texture released: request_id={}, texture_id={}, release_disposition={}",
-            session.request_id, session.texture_id, release.release_disposition
+            "Smoke texture released without engine teardown: engine_handle={}, request_id={}, texture_id={}, release_disposition={}",
+            session.engine_handle,
+            session.request_id,
+            session.texture_id,
+            release.release_disposition
         );
 
         Ok(matches!(
@@ -196,10 +226,16 @@ mod android_smoke {
                 let api = Arc::new(
                     FfiApi::builder()
                         .with_source_provider(Arc::new(AndroidSmokeSourceProvider::new()))
+                        .with_android_texture_registration_strategy(
+                            AndroidTextureRegistrationStrategy::ZeroCopySeam,
+                        )
                         .with_event_callback(Arc::new(log_ffi_event))
                         .build(),
                 );
                 let _ = replace_global_api(api.clone());
+                info!(
+                    "Smoke runtime initialized with Android zero-copy registration strategy"
+                );
                 api
             })
             .clone()
@@ -215,6 +251,7 @@ mod android_smoke {
             engine_handle,
             request_id,
             texture_id,
+            released: false,
         });
     }
 
@@ -228,20 +265,58 @@ mod android_smoke {
             return;
         };
 
-        let release = irondash_ffi_release_texture(session.request_id, session.engine_handle);
-        if release.error_code != 0 {
-            warn!(
-                "Best-effort release before reacquire failed: request_id={}, error_code={}",
-                session.request_id, release.error_code
+        debug!(
+            "Smoke best-effort teardown before reacquire: engine_handle={}, request_id={}, texture_id={}, released={}",
+            session.engine_handle,
+            session.request_id,
+            session.texture_id,
+            session.released
+        );
+
+        if !session.released {
+            let release = irondash_ffi_release_texture(session.request_id, session.engine_handle);
+            if release.error_code != 0 {
+                warn!(
+                    "Best-effort release before reacquire failed: request_id={}, error_code={}",
+                    session.request_id, release.error_code
+                );
+            } else {
+                debug!(
+                    "Best-effort release before reacquire completed: engine_handle={}, request_id={}, texture_id={}, release_disposition={}",
+                    session.engine_handle,
+                    session.request_id,
+                    session.texture_id,
+                    release.release_disposition
+                );
+            }
+            log_request_state("after best-effort release", session.request_id);
+        } else {
+            debug!(
+                "Smoke best-effort teardown before reacquire skipping release call because request is already released: engine_handle={}, request_id={}, texture_id={}",
+                session.engine_handle,
+                session.request_id,
+                session.texture_id
             );
         }
-        log_request_state("after best-effort release", session.request_id);
 
+        debug!(
+            "Smoke best-effort teardown calling unregister_engine: engine_handle={}, request_id={}",
+            session.engine_handle,
+            session.request_id
+        );
         let unregister = irondash_ffi_unregister_engine(session.engine_handle);
         if !unregister.success && unregister.error_code != 0 {
             warn!(
                 "Best-effort unregister before reacquire failed: engine_handle={}, error_code={}",
                 session.engine_handle, unregister.error_code
+            );
+        } else {
+            debug!(
+                "Smoke best-effort unregister before reacquire completed: engine_handle={}, success={}, is_registered={}, error_code={}",
+                session.engine_handle,
+                unregister.success,
+                unregister.is_registered,
+                unregister.error_code
             );
         }
 
@@ -310,6 +385,13 @@ mod android_smoke {
         generation: u32,
     ) -> Result<Arc<SharedSource>, ResourceError> {
         let cleaner = Arc::new(AndroidPlatformCleaner::new());
+        info!(
+            "Creating smoke AHardwareBuffer source: source_id={}, generation={}, size={}x{}",
+            source_id.as_u64(),
+            generation,
+            SMOKE_WIDTH,
+            SMOKE_HEIGHT
+        );
         let ahb_ptr = unsafe { allocate_ahardware_buffer(SMOKE_WIDTH, SMOKE_HEIGHT)? };
 
         if let Err(err) = unsafe { fill_ahardware_buffer(ahb_ptr, SMOKE_WIDTH, SMOKE_HEIGHT, generation) } {
@@ -320,6 +402,13 @@ mod android_smoke {
         }
 
         let handle = unsafe { AndroidPlatformHandle::from_ahb(ahb_ptr, SMOKE_WIDTH, SMOKE_HEIGHT) };
+        debug!(
+            "Created smoke AHardwareBuffer handle: source_id={}, generation={}, ahb_ptr={:?}, bytes={}",
+            source_id.as_u64(),
+            generation,
+            ahb_ptr,
+            (SMOKE_WIDTH as usize) * (SMOKE_HEIGHT as usize) * SMOKE_BYTES_PER_PIXEL
+        );
         SharedSource::new_with_deferred_drop(
             source_id,
             handle.into(),
@@ -350,6 +439,14 @@ mod android_smoke {
                 status
             )));
         }
+
+        debug!(
+            "AHardwareBuffer_allocate succeeded: ptr={:?}, size={}x{}, usage=0x{:x}",
+            buffer,
+            width,
+            height,
+            desc.usage
+        );
 
         Ok(buffer.cast())
     }
@@ -392,6 +489,16 @@ mod android_smoke {
             })?;
         let bytes = slice::from_raw_parts_mut(data.cast::<u8>(), byte_len);
 
+        debug!(
+            "Filling AHardwareBuffer: ptr={:?}, generation={}, desc={}x{}, stride_pixels={}, byte_len={}",
+            ahb_ptr,
+            generation,
+            desc.width,
+            desc.height,
+            desc.stride,
+            byte_len
+        );
+
         for y in 0..rows {
             for x in 0..stride {
                 let offset = (y * stride + x) * SMOKE_BYTES_PER_PIXEL;
@@ -415,6 +522,14 @@ mod android_smoke {
                 unlock_status
             )));
         }
+
+        debug!(
+            "Filled AHardwareBuffer successfully: ptr={:?}, generation={}, stride_pixels={}, rows={}",
+            ahb_ptr,
+            generation,
+            stride,
+            rows
+        );
 
         Ok(())
     }

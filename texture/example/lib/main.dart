@@ -104,7 +104,7 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
         _textureId = textureId;
         _status = textureId == null
             ? '申请失败，未拿到 texture_id'
-            : '纹理已就绪：ffi-api -> engine-texture-registry -> platform-android bridge';
+        : '纹理已就绪：ffi-api -> engine-texture-registry -> irondash hardware-buffer path';
       });
     } catch (error) {
       if (!mounted) {
@@ -140,7 +140,9 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
       }
       setState(() {
         _textureId = null;
-        _status = released ? '已请求释放纹理与共享源' : '当前没有可释放的活动会话';
+        _status = released
+            ? '已释放纹理；engine 保持注册，下一次 acquire 前会做延迟清理'
+            : '当前没有可释放的活动会话';
       });
     } catch (error) {
       if (!mounted) {
