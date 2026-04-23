@@ -1,4 +1,4 @@
-use std::{cell::RefCell, cmp::min, marker::PhantomData, slice, sync::Arc};
+use std::{cell::RefCell, cmp::min, marker::PhantomData, os::fd::OwnedFd, slice, sync::Arc};
 
 use irondash_engine_context::EngineContext;
 use jni::objects::{GlobalRef, JObject};
@@ -128,6 +128,59 @@ pub trait AHardwareBufferProvider: Send + Sync {
     fn get_height(&self) -> i32;
 }
 
+/// Canonical Android hardware-buffer format understood by the import path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AndroidHardwareBufferFormat {
+    /// `AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM`
+    Rgba8888,
+}
+
+/// Per-frame lease returned by the Android hardware-buffer import provider.
+pub struct HardwareBufferFrame {
+    /// Acquired hardware-buffer handle.
+    pub buffer: AHardwareBufferHandle,
+    /// Visible width in pixels.
+    pub width: i32,
+    /// Visible height in pixels.
+    pub height: i32,
+    /// Producer-declared pixel format.
+    pub format: AndroidHardwareBufferFormat,
+    /// Monotonic generation for the shared source.
+    pub generation: u64,
+    /// Optional acquire fence transferred to the consumer.
+    pub acquire_fence_fd: Option<OwnedFd>,
+    /// Provider-unique release token for this lease.
+    pub release_token: u64,
+}
+
+/// Completion payload returned to the frame provider after a lease retires.
+pub struct HardwareBufferFrameRelease {
+    /// Provider-issued token that identifies the frame being released.
+    pub release_token: u64,
+    /// Optional release fence transferred back to the producer.
+    pub release_fence_fd: Option<OwnedFd>,
+}
+
+/// Outcome returned by `AHardwareBufferFrameProvider::acquire_latest_frame()`.
+pub enum AcquireFrameOutcome {
+    /// A concrete frame lease was acquired.
+    Acquired(HardwareBufferFrame),
+    /// No frame newer than `after_generation` is currently available.
+    NoNewFrame {
+        /// Latest generation currently known to the provider.
+        latest_generation: u64,
+    },
+}
+
+/// Provider contract for the final Android hardware-buffer import path.
+pub trait AHardwareBufferFrameProvider: Send + Sync {
+    /// Acquires the newest frame lease after the provided generation.
+    fn acquire_latest_frame(&self, after_generation: u64) -> Result<AcquireFrameOutcome>;
+
+    /// Releases a previously acquired frame lease.
+    fn release_frame(&self, release: HardwareBufferFrameRelease) -> Result<()>;
+}
+
 /// Trait for explicit flush of pending AHardwareBuffer payload.
 ///
 /// This trait allows normalizing Android's push model to match Darwin's
@@ -209,6 +262,24 @@ impl AndroidHardwareBufferTextureSource {
     }
 }
 
+/// Marker type for the final Android hardware-buffer import path.
+pub struct ImportedHardwareBufferTexture;
+
+const IMPORT_BACKEND_UNAVAILABLE_REASON: &str =
+    "Android hardware-buffer consumer import backend is not implemented in the irondash fork; only the SurfaceTexture/ANativeWindow seam exists";
+
+impl ImportedHardwareBufferTexture {
+    /// Returns whether this fork build can perform real Android consumer import.
+    pub fn import_backend_available() -> bool {
+        false
+    }
+
+    /// Returns the current reason why final-path consumer import is unavailable.
+    pub fn unavailable_reason() -> &'static str {
+        IMPORT_BACKEND_UNAVAILABLE_REASON
+    }
+}
+
 // ============================================================================
 
 use crate::{
@@ -237,6 +308,13 @@ impl PayloadPathContract for NativeWindow {
 
 impl PayloadPathContract for Surface {
     /// Surface doesn't use get_payload(); direct surface access.
+    fn payload_timing() -> PayloadTiming {
+        PayloadTiming::NotApplicable
+    }
+}
+
+impl PayloadPathContract for ImportedHardwareBufferTexture {
+    /// Imported hardware-buffer textures do not fetch payload through `get_payload()`.
     fn payload_timing() -> PayloadTiming {
         PayloadTiming::NotApplicable
     }
@@ -696,6 +774,17 @@ impl PlatformTexture<NativeWindow> {
         source: AndroidHardwareBufferTextureSource,
     ) -> Result<PlatformTexture<NativeWindow>> {
         PlatformTexture::new(engine_handle, None, Some(source))
+    }
+}
+
+impl PlatformTexture<ImportedHardwareBufferTexture> {
+    pub fn new_with_hardware_buffer_frame_source(
+        _engine_handle: i64,
+        _provider: Arc<dyn AHardwareBufferFrameProvider>,
+    ) -> Result<PlatformTexture<ImportedHardwareBufferTexture>> {
+        Err(Error::native_registration_failed(Some(
+            ImportedHardwareBufferTexture::unavailable_reason().into(),
+        )))
     }
 }
 

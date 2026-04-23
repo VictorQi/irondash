@@ -6,14 +6,16 @@ Android 路径会走：
 
 - Flutter host
 - example Rust glue
-- ffi-api（当前 smoke host 显式启用 `AndroidTextureRegistrationStrategy::ZeroCopySeam`）
-- engine-texture-registry（`AndroidZeroCopy` request）
+- ffi-api（当前 smoke host 显式启用 `AndroidTextureRegistrationStrategy::HardwareBufferSeam`）
+- engine-texture-registry（`AndroidHardwareBufferSeam` request）
 - irondash `Texture::new_with_hardware_buffer_source()`
 - `mark_frame_available()` / `DeferredPayloadFlush` 对应的 hardware-buffer delivery 路径
 
 其中共享源会在 Rust glue 里创建一个最小 RGBA8888 AHardwareBuffer，并挂上 AndroidPlatformCleaner，供 SharedSource 持有和释放。
 
 注意：`platform-android::AndroidFrameBridge` 仍然保留为默认 CPU-copy fallback/baseline，但当前 smoke host 这轮验证优先走的是显式 AndroidHardwareBuffer 注册路径，不再是旧的默认 bridge 路径。
+
+补充：仓库代码现在已经新增独立的 `HardwareBufferImport` backend contract（`ImportedHardwareBufferTexture` / `AHardwareBufferFrameProvider`），但这个 example 仍继续固定使用 `HardwareBufferSeam`。原因是 irondash fork 里还没有真正的 consumer-import substrate；如果强行请求 import path，当前会收到精确的 bridge-unavailable 原因，而不是偷偷回退成 seam。
 
 ## 目录
 
@@ -74,7 +76,7 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 
 - 设备：Xiaomi 15 Ultra
 - 日期：2026-04-23
-- 结果：clean rebuild 后复用新的 `app-debug.apk` 通过 `flutter run --use-application-binary` 完成真机 smoke；冷启动自动 acquire 成功显示纹理并拿到 `request_id=0` / `texture_id=0`；`Release Texture` 后 UI 进入“当前没有活动纹理”，并且没有立即出现 `EngineGone`；再次 `Acquire Smoke Texture` 时，smoke host 会先消费保留下来的待清理 session，执行 best-effort `unregister_engine`，随后重新 `register_engine` 并拿到新的 `request_id=1` / `texture_id=1`
+- 结果：在 `engine-texture-registry` / `ffi-api` 完成 seam-vs-import 公共类型对齐后，重新 `flutter clean`、重建 debug APK，并通过 `flutter run --use-application-binary` 完成真机 smoke；冷启动自动 acquire 成功显示纹理并拿到 `request_id=0` / `texture_id=0`；`Release Texture` 后 UI 进入“当前没有活动纹理”并对应 `ResourceReleased -> Unloaded`；再次 `Acquire Smoke Texture` 时，smoke host 会先消费保留下来的待清理 session，执行 best-effort `unregister_engine -> EngineGone`，随后重新 `register_engine` 并拿到新的 `request_id=1` / `texture_id=1`
 - 增强日志确认：当前 smoke host 创建了真实 `AHardwareBuffer`（`256x256`），冷启动和 reacquire 都直接走到 `TextureReady -> Ready`，而没有再出现 `FFI Android delivery attempting bridge` / `AndroidFrameBridge copy start` 这一类默认 CPU-copy bridge 日志
 - UI 回归也确认：reacquire 后页面重新显示“纹理已就绪”，并更新到 `Texture id: 1`
 - 语义澄清：当前这条链已经收口了“显式 AndroidHardwareBuffer 注册主路径”，但如果把“真实 zero-copy”定义成“最终不发生 `AHardwareBuffer -> ANativeWindow` 的复制”，这仍不是终态

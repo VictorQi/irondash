@@ -150,6 +150,24 @@ impl Texture<NativeWindow> {
 }
 
 #[cfg(target_os = "android")]
+impl Texture<ImportedHardwareBufferTexture> {
+    /// Creates a distinct Android final-path texture registration backed by an
+    /// explicit frame-provider contract.
+    pub fn new_with_hardware_buffer_frame_source(
+        engine_handle: i64,
+        provider: Arc<dyn AHardwareBufferFrameProvider>,
+    ) -> Result<Self> {
+        Ok(Self {
+            platform_texture:
+                PlatformTexture::<ImportedHardwareBufferTexture>::new_with_hardware_buffer_frame_source(
+                    engine_handle,
+                    provider,
+                )?,
+        })
+    }
+}
+
+#[cfg(target_os = "android")]
 impl DeferredPayloadFlush for Texture<NativeWindow> {
     fn flush_payload(&self) -> Result<()> {
         self.platform_texture.flush_payload()
@@ -370,8 +388,10 @@ pub enum SurfaceCachePolicy {
 #[cfg(target_os = "android")]
 mod android_zero_copy {
     pub use crate::platform::{
-        AHardwareBufferHandle, AHardwareBufferProvider, AndroidHardwareBufferSourceKind,
-        AndroidHardwareBufferTextureSource, DeferredPayloadFlush,
+        AHardwareBufferFrameProvider, AHardwareBufferHandle, AHardwareBufferProvider,
+        AcquireFrameOutcome, AndroidHardwareBufferFormat, AndroidHardwareBufferSourceKind,
+        AndroidHardwareBufferTextureSource, DeferredPayloadFlush, HardwareBufferFrame,
+        HardwareBufferFrameRelease, ImportedHardwareBufferTexture,
     };
 }
 

@@ -227,7 +227,7 @@ mod android_smoke {
                     FfiApi::builder()
                         .with_source_provider(Arc::new(AndroidSmokeSourceProvider::new()))
                         .with_android_texture_registration_strategy(
-                            AndroidTextureRegistrationStrategy::ZeroCopySeam,
+                            AndroidTextureRegistrationStrategy::HardwareBufferSeam,
                         )
                         .with_event_callback(Arc::new(log_ffi_event))
                         .build(),

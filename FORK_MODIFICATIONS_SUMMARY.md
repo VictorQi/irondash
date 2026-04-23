@@ -236,6 +236,8 @@ pub fn create_texture(
 
 Provide extension points for AHardwareBuffer/EGL-oriented integration without forcing the current CPU-copy path.
 
+Follow-up design for the final no-copy delivery path: `F04_ANDROID_FINAL_ZERO_COPY_DELIVERY_DESIGN.md`.
+
 ### Changes
 
 **File**: `texture/src/platform/android/mod.rs`
@@ -261,6 +263,39 @@ pub trait AHardwareBufferProvider: Send + Sync {
     fn get_height(&self) -> i32;
 }
 
+// NEW: final-path frame provider contract
+pub enum AndroidHardwareBufferFormat {
+    Rgba8888,
+}
+
+pub struct HardwareBufferFrame {
+    pub buffer: AHardwareBufferHandle,
+    pub width: i32,
+    pub height: i32,
+    pub format: AndroidHardwareBufferFormat,
+    pub generation: u64,
+    pub acquire_fence_fd: Option<OwnedFd>,
+    pub release_token: u64,
+}
+
+pub struct HardwareBufferFrameRelease {
+    pub release_token: u64,
+    pub release_fence_fd: Option<OwnedFd>,
+}
+
+pub enum AcquireFrameOutcome {
+    Acquired(HardwareBufferFrame),
+    NoNewFrame { latest_generation: u64 },
+}
+
+pub trait AHardwareBufferFrameProvider: Send + Sync {
+    fn acquire_latest_frame(&self, after_generation: u64) -> Result<AcquireFrameOutcome>;
+    fn release_frame(&self, release: HardwareBufferFrameRelease) -> Result<()>;
+}
+
+// NEW: distinct final-path texture marker
+pub struct ImportedHardwareBufferTexture;
+
 // NEW: DeferredPayloadFlush trait
 pub trait DeferredPayloadFlush {
     fn flush_payload(&self) -> Result<()>;
@@ -273,9 +308,15 @@ pub trait DeferredPayloadFlush {
 // Re-export for Android builds
 #[cfg(target_os = "android")]
 pub use crate::platform::android::{
+    AHardwareBufferFrameProvider,
     AHardwareBufferHandle,
     AHardwareBufferProvider,
+    AcquireFrameOutcome,
+    AndroidHardwareBufferFormat,
     DeferredPayloadFlush,
+    HardwareBufferFrame,
+    HardwareBufferFrameRelease,
+    ImportedHardwareBufferTexture,
 };
 ```
 
@@ -302,6 +343,11 @@ impl AHardwareBufferProvider for EglImageProvider {
 let provider = Arc::new(EglImageProvider::new(ahb));
 // TODO: Texture::new_with_ahardware_buffer(engine_handle, provider)
 ```
+
+Current fork status after the 2026-04-23 follow-up is intentionally split in two layers:
+
+- the public final-path contract now exists in code and is distinct from the seam path
+- the actual consumer-import backend is still unavailable inside the fork, so `Texture::<ImportedHardwareBufferTexture>::new_with_hardware_buffer_frame_source(...)` currently fails with a precise backend-unavailable reason instead of silently reusing the seam path
 
 ---
 
@@ -411,9 +457,11 @@ texture.unregister()?;  // May fail; handle explicitly
 
 - [x] `AHardwareBufferHandle` wrapper added
 - [x] `AHardwareBufferProvider` trait defined
+- [x] `AHardwareBufferFrameProvider` final-path trait defined
+- [x] `ImportedHardwareBufferTexture` distinct final-path marker added
 - [x] `DeferredPayloadFlush` trait defined
 - [x] Re-exported for Android builds
-- [x] Documentation for future integration
+- [x] Import path now fails at a precise backend boundary instead of generic unsupported
 
 ### ✅ F-05 Acceptance
 
@@ -447,6 +495,7 @@ texture.unregister()?;  // May fail; handle explicitly
 ### For `platform-android`
 
 - [ ] Implement `AHardwareBufferProvider` for EGL path
+- [ ] Implement the actual consumer-import substrate behind `ImportedHardwareBufferTexture`
 - [ ] Use `DeferredPayloadFlush` if normalizing to pull model
 - [ ] Preserve CPU-copy path for backward compatibility
 
@@ -461,6 +510,8 @@ texture.unregister()?;  // May fail; handle explicitly
 ## Future Work (Wave 2)
 
 ### F-04 Follow-up: Full Zero-Copy Implementation
+
+Reference design: `F04_ANDROID_FINAL_ZERO_COPY_DELIVERY_DESIGN.md`
 
 When `platform-android` crate is ready:
 
