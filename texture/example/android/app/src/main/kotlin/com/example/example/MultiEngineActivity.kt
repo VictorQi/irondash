@@ -8,7 +8,6 @@ import android.widget.TextView
 import androidx.fragment.app.FragmentActivity
 import io.flutter.FlutterInjector
 import io.flutter.embedding.android.FlutterFragment
-import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.embedding.engine.FlutterEngineGroup
 import io.flutter.embedding.engine.dart.DartExecutor
@@ -46,40 +45,51 @@ class MultiEngineActivity : FragmentActivity() {
         ensureEngine(ENGINE_B_ID, SLOT_B_ROUTE)
 
         destroyPanelAButton.setOnClickListener {
-            destroyPanel(
+            togglePanel(
                 engineId = ENGINE_A_ID,
+                initialRoute = SLOT_A_ROUTE,
+                containerId = R.id.flutter_panel_a,
                 fragmentTag = FRAGMENT_A_TAG,
                 placeholder = panelAPlaceholder,
                 button = destroyPanelAButton,
+                panelLabel = "Panel A",
             )
         }
         destroyPanelBButton.setOnClickListener {
-            destroyPanel(
+            togglePanel(
                 engineId = ENGINE_B_ID,
+                initialRoute = SLOT_B_ROUTE,
+                containerId = R.id.flutter_panel_b,
                 fragmentTag = FRAGMENT_B_TAG,
                 placeholder = panelBPlaceholder,
                 button = destroyPanelBButton,
+                panelLabel = "Panel B",
             )
         }
 
         if (savedInstanceState == null) {
-            supportFragmentManager.beginTransaction()
-                .replace(
-                    R.id.flutter_panel_a,
-                    FlutterFragment.withCachedEngine(ENGINE_A_ID)
-                        .shouldAttachEngineToActivity(false)
-                        .build<FlutterFragment>(),
-                    FRAGMENT_A_TAG,
-                )
-                .replace(
-                    R.id.flutter_panel_b,
-                    FlutterFragment.withCachedEngine(ENGINE_B_ID)
-                        .shouldAttachEngineToActivity(false)
-                        .build<FlutterFragment>(),
-                    FRAGMENT_B_TAG,
-                )
-                .commitNow()
+            attachPanel(R.id.flutter_panel_a, ENGINE_A_ID, FRAGMENT_A_TAG)
+            attachPanel(R.id.flutter_panel_b, ENGINE_B_ID, FRAGMENT_B_TAG)
         }
+
+        syncPanelState(
+            engineId = ENGINE_A_ID,
+            initialRoute = SLOT_A_ROUTE,
+            containerId = R.id.flutter_panel_a,
+            fragmentTag = FRAGMENT_A_TAG,
+            placeholder = panelAPlaceholder,
+            button = destroyPanelAButton,
+            panelLabel = "Panel A",
+        )
+        syncPanelState(
+            engineId = ENGINE_B_ID,
+            initialRoute = SLOT_B_ROUTE,
+            containerId = R.id.flutter_panel_b,
+            fragmentTag = FRAGMENT_B_TAG,
+            placeholder = panelBPlaceholder,
+            button = destroyPanelBButton,
+            panelLabel = "Panel B",
+        )
     }
 
     override fun onPostResume() {
@@ -155,11 +165,59 @@ class MultiEngineActivity : FragmentActivity() {
         engine?.destroy()
     }
 
+    private fun attachPanel(containerId: Int, engineId: String, fragmentTag: String) {
+        if (supportFragmentManager.findFragmentByTag(fragmentTag) != null) {
+            return
+        }
+
+        supportFragmentManager.beginTransaction()
+            .replace(
+                containerId,
+                FlutterFragment.withCachedEngine(engineId)
+                    .shouldAttachEngineToActivity(false)
+                    .build<FlutterFragment>(),
+                fragmentTag,
+            )
+            .commitNow()
+    }
+
+    private fun togglePanel(
+        engineId: String,
+        initialRoute: String,
+        containerId: Int,
+        fragmentTag: String,
+        placeholder: TextView,
+        button: Button,
+        panelLabel: String,
+    ) {
+        if (FlutterEngineCache.getInstance().contains(engineId)) {
+            destroyPanel(
+                engineId = engineId,
+                fragmentTag = fragmentTag,
+                placeholder = placeholder,
+                button = button,
+                panelLabel = panelLabel,
+            )
+            return
+        }
+
+        recreatePanel(
+            engineId = engineId,
+            initialRoute = initialRoute,
+            containerId = containerId,
+            fragmentTag = fragmentTag,
+            placeholder = placeholder,
+            button = button,
+            panelLabel = panelLabel,
+        )
+    }
+
     private fun destroyPanel(
         engineId: String,
         fragmentTag: String,
         placeholder: TextView,
         button: Button,
+        panelLabel: String,
     ) {
         val fragment = supportFragmentManager.findFragmentByTag(fragmentTag)
         if (fragment != null) {
@@ -169,10 +227,52 @@ class MultiEngineActivity : FragmentActivity() {
         }
 
         placeholder.visibility = View.VISIBLE
-        button.isEnabled = false
-        placeholder.post {
-            destroyEngine(engineId)
+        button.text = recreateButtonLabel(panelLabel)
+        destroyEngine(engineId)
+    }
+
+    private fun recreatePanel(
+        engineId: String,
+        initialRoute: String,
+        containerId: Int,
+        fragmentTag: String,
+        placeholder: TextView,
+        button: Button,
+        panelLabel: String,
+    ) {
+        ensureEngine(engineId, initialRoute)
+        attachPanel(containerId, engineId, fragmentTag)
+        placeholder.visibility = View.GONE
+        button.text = destroyButtonLabel(panelLabel)
+    }
+
+    private fun syncPanelState(
+        engineId: String,
+        initialRoute: String,
+        containerId: Int,
+        fragmentTag: String,
+        placeholder: TextView,
+        button: Button,
+        panelLabel: String,
+    ) {
+        val active = FlutterEngineCache.getInstance().contains(engineId)
+        if (active) {
+            ensureEngine(engineId, initialRoute)
+            attachPanel(containerId, engineId, fragmentTag)
+            placeholder.visibility = View.GONE
+            button.text = destroyButtonLabel(panelLabel)
+        } else {
+            placeholder.visibility = View.VISIBLE
+            button.text = recreateButtonLabel(panelLabel)
         }
+    }
+
+    private fun destroyButtonLabel(panelLabel: String): String {
+        return "Destroy $panelLabel"
+    }
+
+    private fun recreateButtonLabel(panelLabel: String): String {
+        return "Recreate $panelLabel"
     }
 
     private fun flutterFragments(): List<FlutterFragment> {

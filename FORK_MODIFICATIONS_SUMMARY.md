@@ -25,8 +25,14 @@ The current fork delta now also covers:
 - A real `HardwareBufferImportTexture` Java helper plus `ImportedHardwareBufferTexture` backend path, so consumer-import capability is probed explicitly and unavailable runtimes now return precise reasons instead of a generic unsupported error.
 - `NativeNotifier` JNI export and notifier-state lifetime fixes inside the loaded Android engine-context native library, together with versioned destroy-handle propagation, so runtime destroy notifications match the `code-base` cleanup path.
 - Cargokit / Gradle packaging fixes that force rebuilt JNI outputs and merged native-lib folders into the final APK, removing the stale-library failure mode observed during Android validation.
-- A reusable single-engine and multi-engine Android smoke host in `texture/example`, including reject diagnostics, bridge-failure diagnostics, panel destroy controls, and the host wiring used for Xiaomi 15 Ultra validation.
-- Verified scope for the current delivery line: plan-1 seam / single-CPU-copy delivery, `release -> reacquire`, duplicate-acquire guardrails, multi-engine destroy / cleanup, and precise import-backend failure surfacing. Final no-copy Android consumer import remains future work.
+- A reusable single-engine and multi-engine Android smoke host in `texture/example`, including reject diagnostics, bridge-failure diagnostics, manual acquire ordering for P0 replay, panel destroy/recreate controls, and launcher cleanup that releases the single-engine baseline before entering `MultiEngineActivity`.
+- Verified scope for the current delivery line: plan-1 seam / single-CPU-copy delivery, `release -> reacquire`, duplicate-acquire guardrails, multi-engine cache-hit fast path, release/destroy/recreate isolation, and precise import-backend failure surfacing. Final no-copy Android consumer import remains future work.
+
+Runtime semantics clarified by the 2026-04-25 Xiaomi 15 Ultra replay:
+
+- `Panel A` first acquire now re-enters the true miss path and shows `Loading -> Ready` after launcher cleanup.
+- `Panel B` cache-hit acquire for the same `source_id=1001` omits `Loading` and goes straight to `TextureReady -> Ready`.
+- Numeric `texture_id` remains engine-local and can repeat across engines, so cross-engine proof uses `same source_id + same source_generation + different engine_handle`, not numeric texture-id uniqueness.
 
 ---
 

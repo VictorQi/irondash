@@ -53,16 +53,51 @@ mod android_smoke {
     const SMOKE_WIDTH: i32 = 256;
     const SMOKE_HEIGHT: i32 = 256;
     const SMOKE_BYTES_PER_PIXEL: usize = 4;
+    const MAX_REQUEST_EVENT_HISTORY: usize = 6;
 
     static SMOKE_RUNTIME: OnceLock<Arc<FfiApi>> = OnceLock::new();
     static SMOKE_SESSIONS: OnceLock<Mutex<HashMap<i64, SmokeSession>>> = OnceLock::new();
+    static SMOKE_DIAGNOSTICS: OnceLock<Mutex<SmokeDiagnosticsState>> = OnceLock::new();
 
     #[derive(Clone, Copy)]
     struct SmokeSession {
         engine_handle: i64,
+        source_id: u64,
         request_id: u64,
         texture_id: i64,
         released: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    struct TrackedRequest {
+        request_id: u64,
+        source_id: u64,
+    }
+
+    #[derive(Clone)]
+    struct SmokeEventSummary {
+        event_name: &'static str,
+        event_type: u32,
+        request_id: u64,
+        source_id: u64,
+        engine_handle: i64,
+        texture_id: i64,
+        status: u32,
+        error_code: u32,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct SmokeSourceSummary {
+        resolve_count: u32,
+        latest_generation: u32,
+    }
+
+    #[derive(Default)]
+    struct SmokeDiagnosticsState {
+        last_request_by_engine: HashMap<i64, TrackedRequest>,
+        last_event_by_engine: HashMap<i64, SmokeEventSummary>,
+        recent_events_by_request: HashMap<u64, Vec<SmokeEventSummary>>,
+        source_summary_by_id: HashMap<u64, SmokeSourceSummary>,
     }
 
     struct AndroidSmokeSourceProvider {
@@ -91,7 +126,10 @@ mod android_smoke {
                 return Err(ResourceError::SourceNotFound(source_id.to_string()));
             }
 
-            create_smoke_source(source_id, self.next_generation())
+            let generation = self.next_generation();
+            let source = create_smoke_source(source_id, generation)?;
+            track_source_resolve(source_id.as_u64(), generation);
+            Ok(source)
         }
     }
 
@@ -147,8 +185,15 @@ mod android_smoke {
             ));
         }
 
+        track_request(engine_handle, response.request_id, SMOKE_SOURCE_ID);
+
         if response.texture_id >= 0 {
-            store_session(engine_handle, response.request_id, response.texture_id);
+            store_session(
+                engine_handle,
+                SMOKE_SOURCE_ID,
+                response.request_id,
+                response.texture_id,
+            );
             drain_events(response.request_id);
             info!(
                 "Smoke texture ready immediately: request_id={}, texture_id={}",
@@ -172,7 +217,7 @@ mod android_smoke {
             )
         })?;
 
-        store_session(engine_handle, response.request_id, texture_id);
+        store_session(engine_handle, SMOKE_SOURCE_ID, response.request_id, texture_id);
         info!(
             "Smoke texture ready: request_id={}, texture_id={}",
             response.request_id, texture_id
@@ -242,6 +287,96 @@ mod android_smoke {
         ))
     }
 
+    pub fn fetch_snapshot(engine_handle: i64) -> String {
+        let _runtime = ensure_runtime();
+
+        let session = smoke_sessions()
+            .lock()
+            .expect("smoke session mutex poisoned")
+            .get(&engine_handle)
+            .copied();
+        let diagnostics = smoke_diagnostics()
+            .lock()
+            .expect("smoke diagnostics mutex poisoned");
+        let tracked_request = diagnostics.last_request_by_engine.get(&engine_handle).copied();
+        let last_event = diagnostics.last_event_by_engine.get(&engine_handle).cloned();
+        drop(diagnostics);
+
+        let request_id = session
+            .map(|session| session.request_id)
+            .or_else(|| tracked_request.map(|tracked| tracked.request_id));
+        let request_state = request_id.and_then(request_state);
+        let source_id = request_state
+            .map(|state| state.source_id)
+            .or_else(|| session.map(|session| session.source_id))
+            .or_else(|| tracked_request.map(|tracked| tracked.source_id));
+        let released = session.map(|session| session.released);
+        let source_summary = source_id
+            .and_then(|source_id| diagnostics_source_summary(source_id));
+        let request_events = request_id
+            .and_then(recent_request_events);
+
+        let request_line = match request_state {
+            Some(state) => format!(
+                "request_state={} ({}) | texture_id={} | error_code={}",
+                state.status,
+                status_name(state.status),
+                state.texture_id,
+                state.error_code
+            ),
+            None => "request_state=- | texture_id=- | error_code=-".to_string(),
+        };
+
+        let event_line = match last_event {
+            Some(event) => format!(
+                "last_event={} ({}) | request_id={} | source_id={} | texture_id={} | status={} ({}) | error_code={}",
+                event.event_name,
+                event.event_type,
+                display_u64(event.request_id),
+                event.source_id,
+                display_i64(event.texture_id),
+                event.status,
+                status_name(event.status),
+                event.error_code
+            ),
+            None => "last_event=-".to_string(),
+        };
+
+        let source_line = match source_summary {
+            Some(summary) => format!(
+                "source_resolve_count={} | source_generation={}",
+                summary.resolve_count, summary.latest_generation
+            ),
+            None => "source_resolve_count=- | source_generation=-".to_string(),
+        };
+
+        let event_history_line = match request_events {
+            Some(events) if !events.is_empty() => format!(
+                "request_events={}",
+                events
+                    .iter()
+                    .map(format_event_for_history)
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            ),
+            _ => "request_events=-".to_string(),
+        };
+
+        format!(
+            "engine_handle={}\nregistration_strategy=HardwareBufferSeam\ndelivery_path=AndroidHardwareBufferSeam\nsource_bytes={}\nsource_id={}\nrequest_id={}\nactive_session={}\nreleased={}\n{}\n{}\n{}\n{}",
+            engine_handle,
+            (SMOKE_WIDTH as usize) * (SMOKE_HEIGHT as usize) * SMOKE_BYTES_PER_PIXEL,
+            display_optional_u64(source_id),
+            display_optional_u64(request_id),
+            session.is_some(),
+            display_bool(released),
+            request_line,
+            event_line,
+            source_line,
+            event_history_line,
+        )
+    }
+
     pub fn run_reject_diagnostic(engine_handle: i64) -> Result<String, String> {
         let _runtime = ensure_runtime();
         info!(
@@ -271,6 +406,7 @@ mod android_smoke {
                 engine_handle,
                 FfiPriorityCode::Visible as u32,
             );
+            track_request(engine_handle, first.request_id, SMOKE_SOURCE_ID);
             debug!(
                 "Smoke reject diagnostic first acquire: decision={}, request_id={}, status={}, texture_id={}, error_code={}",
                 first.decision,
@@ -372,6 +508,7 @@ mod android_smoke {
                 engine_handle,
                 FfiPriorityCode::Visible as u32,
             );
+            track_request(engine_handle, response.request_id, SMOKE_SOURCE_ID);
             debug!(
                 "Smoke bridge-failure diagnostic acquire: decision={}, request_id={}, status={}, texture_id={}, error_code={}",
                 response.decision,
@@ -501,17 +638,67 @@ mod android_smoke {
         SMOKE_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    fn store_session(engine_handle: i64, request_id: u64, texture_id: i64) {
+    fn smoke_diagnostics() -> &'static Mutex<SmokeDiagnosticsState> {
+        SMOKE_DIAGNOSTICS.get_or_init(|| Mutex::new(SmokeDiagnosticsState::default()))
+    }
+
+    fn track_source_resolve(source_id: u64, generation: u32) {
+        let mut diagnostics = smoke_diagnostics()
+            .lock()
+            .expect("smoke diagnostics mutex poisoned");
+        let entry = diagnostics
+            .source_summary_by_id
+            .entry(source_id)
+            .or_default();
+        entry.resolve_count = entry.resolve_count.saturating_add(1);
+        entry.latest_generation = generation;
+    }
+
+    fn diagnostics_source_summary(source_id: u64) -> Option<SmokeSourceSummary> {
+        smoke_diagnostics()
+            .lock()
+            .expect("smoke diagnostics mutex poisoned")
+            .source_summary_by_id
+            .get(&source_id)
+            .copied()
+    }
+
+    fn recent_request_events(request_id: u64) -> Option<Vec<SmokeEventSummary>> {
+        smoke_diagnostics()
+            .lock()
+            .expect("smoke diagnostics mutex poisoned")
+            .recent_events_by_request
+            .get(&request_id)
+            .cloned()
+    }
+
+    fn store_session(engine_handle: i64, source_id: u64, request_id: u64, texture_id: i64) {
+        track_request(engine_handle, request_id, source_id);
         let mut guard = smoke_sessions().lock().expect("smoke session mutex poisoned");
         guard.insert(
             engine_handle,
             SmokeSession {
                 engine_handle,
+                source_id,
                 request_id,
                 texture_id,
                 released: false,
             },
         );
+    }
+
+    fn track_request(engine_handle: i64, request_id: u64, source_id: u64) {
+        smoke_diagnostics()
+            .lock()
+            .expect("smoke diagnostics mutex poisoned")
+            .last_request_by_engine
+            .insert(
+                engine_handle,
+                TrackedRequest {
+                    request_id,
+                    source_id,
+                },
+            );
     }
 
     fn release_existing_session(engine_handle: i64) {
@@ -637,6 +824,135 @@ mod android_smoke {
 
     fn log_ffi_event(event: FfiEvent) {
         debug!("smoke ffi callback event: {:?}", event);
+
+        if let Some(summary) = summarize_event(event) {
+            let mut diagnostics = smoke_diagnostics()
+                .lock()
+                .expect("smoke diagnostics mutex poisoned");
+            diagnostics
+                .last_event_by_engine
+                .insert(summary.engine_handle, summary.clone());
+            if summary.event_name != "EngineGone" {
+                let events = diagnostics
+                    .recent_events_by_request
+                    .entry(summary.request_id)
+                    .or_default();
+                events.push(summary);
+                if events.len() > MAX_REQUEST_EVENT_HISTORY {
+                    let overflow = events.len() - MAX_REQUEST_EVENT_HISTORY;
+                    events.drain(0..overflow);
+                }
+            }
+        }
+    }
+
+    fn format_event_for_history(event: &SmokeEventSummary) -> String {
+        match event.event_name {
+            "StatusChanged" => format!(
+                "{}:{}",
+                event.event_name,
+                status_name(event.status)
+            ),
+            "TextureReady" => format!(
+                "{}:{}",
+                event.event_name,
+                display_i64(event.texture_id)
+            ),
+            _ => event.event_name.to_string(),
+        }
+    }
+
+    fn summarize_event(event: FfiEvent) -> Option<SmokeEventSummary> {
+        let event_name = event.event_type_name();
+        let record = event.to_c();
+        let request_state = if event_name == "EngineGone" {
+            None
+        } else {
+            request_state(record.request_id)
+        };
+        let engine_handle = if record.engine_handle != 0 {
+            record.engine_handle
+        } else {
+            request_state.map(|state| state.engine_handle)?
+        };
+
+        Some(SmokeEventSummary {
+            event_name,
+            event_type: record.event_type,
+            request_id: record.request_id,
+            source_id: if record.source_id != 0 {
+                record.source_id
+            } else {
+                request_state.map(|state| state.source_id).unwrap_or_default()
+            },
+            engine_handle,
+            texture_id: if record.texture_id >= 0 {
+                record.texture_id
+            } else {
+                request_state.map(|state| state.texture_id).unwrap_or(-1)
+            },
+            status: if record.status != 0 {
+                record.status
+            } else {
+                request_state.map(|state| state.status).unwrap_or_default()
+            },
+            error_code: if record.error_code != 0 {
+                record.error_code
+            } else {
+                request_state.map(|state| state.error_code).unwrap_or_default()
+            },
+        })
+    }
+
+    fn request_state(request_id: u64) -> Option<FfiRequestStateSnapshot> {
+        let mut state = FfiRequestStateSnapshot::default();
+        if irondash_ffi_get_request_state(request_id, &mut state as *mut _) {
+            Some(state)
+        } else {
+            None
+        }
+    }
+
+    fn status_name(status: u32) -> &'static str {
+        match status {
+            1 => "Pending",
+            2 => "Loading",
+            3 => "Loaded",
+            4 => "Registering",
+            5 => "Registered",
+            6 => "Ready",
+            7 => "Unregistering",
+            8 => "Unloading",
+            9 => "Unloaded",
+            10 => "Failed",
+            11 => "Canceling",
+            12 => "Canceled",
+            _ => "Unknown",
+        }
+    }
+
+    fn display_u64(value: u64) -> String {
+        value.to_string()
+    }
+
+    fn display_optional_u64(value: Option<u64>) -> String {
+        value.map(display_u64).unwrap_or_else(|| "-".to_string())
+    }
+
+    fn display_i64(value: i64) -> String {
+        if value < 0 {
+            "-".to_string()
+        } else {
+            value.to_string()
+        }
+    }
+
+    fn display_bool(value: Option<bool>) -> &'static str {
+        match value {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "-",
+        }
     }
 
     fn create_smoke_source(
@@ -1017,6 +1333,27 @@ pub extern "C" fn run_bridge_failure_diagnostic_example(
         {
             let _ = engine_id;
             port.send("bridge diagnostic is Android-only".to_string());
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn fetch_smoke_snapshot_example(engine_id: i64, ffi_ptr: *mut c_void, port: i64) {
+    init_logging();
+    irondash_dart_ffi::irondash_init_ffi(ffi_ptr);
+
+    RunLoop::sender_for_main_thread().unwrap().send(move || {
+        let port = irondash_dart_ffi::DartPort::new(port);
+
+        #[cfg(target_os = "android")]
+        {
+            let _ = port.send(android_smoke::fetch_snapshot(engine_id));
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = engine_id;
+            let _ = port.send("smoke snapshot is Android-only".to_string());
         }
     });
 }
