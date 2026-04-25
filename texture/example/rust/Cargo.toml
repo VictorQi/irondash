@@ -25,6 +25,7 @@ error-model = { path = "../../../../crates/error-model" }
 ffi-api = { path = "../../../../crates/ffi-api" }
 platform-android = { path = "../../../../crates/platform-android" }
 protocol = { path = "../../../../crates/protocol" }
+request-orchestrator = { path = "../../../../crates/request-orchestrator" }
 shared-source = { path = "../../../../crates/shared-source" }
 
 [target.'cfg(target_os = "ios")'.dependencies]

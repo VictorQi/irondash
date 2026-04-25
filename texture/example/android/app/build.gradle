@@ -27,11 +27,6 @@ android {
     sourceSets {
         main {
             java.srcDirs += 'src/main/kotlin'
-            jniLibs.srcDirs += [
-                "$buildDir/jniLibs/debug",
-                "$buildDir/jniLibs/profile",
-                "$buildDir/jniLibs/release",
-            ]
         }
     }
 

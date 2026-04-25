@@ -1,7 +1,7 @@
 # Irondash Fork Modifications Summary
 
-> **Status**: Complete (Wave 1)
-> **Date**: 2026-03-29
+> **Status**: Wave 1 complete; 2026-04-25 Android runtime closure complete
+> **Date**: 2026-04-25
 > **Author**: Tech Lead + Engineering Team
 > **Reference**: `../IRONDASH_FORK_WORKBOOK.md`
 
@@ -15,6 +15,18 @@ All changes are designed to be:
 - **Upstream-compatible**: Changes can be maintained as a fork diff
 - **Project-specific hooks**: Extension points for `code-base` integration
 - **Backward-compatible**: Existing APIs preserved with default behavior
+
+## 2026-04-25 Stage Summary
+
+Wave 2 extends the original fork-level design hooks into runtime-validated Android behavior.
+
+The current fork delta now also covers:
+
+- A real `HardwareBufferImportTexture` Java helper plus `ImportedHardwareBufferTexture` backend path, so consumer-import capability is probed explicitly and unavailable runtimes now return precise reasons instead of a generic unsupported error.
+- `NativeNotifier` JNI export and notifier-state lifetime fixes inside the loaded Android engine-context native library, together with versioned destroy-handle propagation, so runtime destroy notifications match the `code-base` cleanup path.
+- Cargokit / Gradle packaging fixes that force rebuilt JNI outputs and merged native-lib folders into the final APK, removing the stale-library failure mode observed during Android validation.
+- A reusable single-engine and multi-engine Android smoke host in `texture/example`, including reject diagnostics, bridge-failure diagnostics, panel destroy controls, and the host wiring used for Xiaomi 15 Ultra validation.
+- Verified scope for the current delivery line: plan-1 seam / single-CPU-copy delivery, `release -> reacquire`, duplicate-acquire guardrails, multi-engine destroy / cleanup, and precise import-backend failure surfacing. Final no-copy Android consumer import remains future work.
 
 ---
 

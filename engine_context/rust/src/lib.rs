@@ -36,6 +36,10 @@ unsafe impl Send for EngineContext {}
 static ENGINE_CONTEXT: OnceCell<EngineContext> = OnceCell::new();
 
 impl EngineContext {
+    const HANDLE_VERSION: i64 = 4;
+    const HANDLE_VERSION_SHIFT: i64 = 48;
+    const HANDLE_VERSION_MASK: i64 = 0xFFi64 << Self::HANDLE_VERSION_SHIFT;
+
     #[cfg(target_os = "android")]
     pub fn get_java_vm() -> Result<&'static jni::JavaVM> {
         PlatformContext::get_java_vm()
@@ -134,20 +138,21 @@ impl EngineContext {
     }
 
     fn strip_version(handle: i64) -> Result<i64> {
-        // this must be same as version in `irondash_engine_context.dart`.
-        let expected_version = 4i64;
-        let version_shift = 48;
-        let version_mask = 0xFFi64 << version_shift;
-        let handle_version = (handle & version_mask) >> version_shift;
+        let handle_version = (handle & Self::HANDLE_VERSION_MASK) >> Self::HANDLE_VERSION_SHIFT;
 
-        if handle_version != expected_version {
+        if handle_version != Self::HANDLE_VERSION {
             return Err(Error::InvalidVersion);
         }
-        let handle = handle & !version_mask;
+        let handle = handle & !Self::HANDLE_VERSION_MASK;
         Ok(handle)
     }
 
+    fn add_version(handle: i64) -> i64 {
+        (handle & !Self::HANDLE_VERSION_MASK) | (Self::HANDLE_VERSION << Self::HANDLE_VERSION_SHIFT)
+    }
+
     pub(crate) fn on_engine_destroyed(&self, handle: i64) {
+        let handle = Self::add_version(handle);
         let callbacks: Vec<_> = self
             .destroy_notifications
             .borrow()
@@ -157,5 +162,19 @@ impl EngineContext {
         for callback in callbacks {
             callback(handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EngineContext;
+
+    #[test]
+    fn destroy_notifications_use_versioned_handles() {
+        let raw_handle = 2i64;
+        let versioned_handle = EngineContext::add_version(raw_handle);
+
+        assert_eq!(versioned_handle, 1125899906842626);
+        assert_eq!(EngineContext::strip_version(versioned_handle).unwrap(), raw_handle);
     }
 }

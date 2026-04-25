@@ -7,6 +7,7 @@ use log::error;
 
 #[cfg(target_os = "android")]
 mod android_smoke {
+    use std::collections::HashMap;
     use std::ffi::c_void;
     use std::slice;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -15,6 +16,7 @@ mod android_smoke {
     use error_model::ResourceError;
     use ffi_api::{
         irondash_ffi_acquire_shared_texture,
+        irondash_ffi_cancel_request,
         irondash_ffi_get_request_state,
         irondash_ffi_init,
         irondash_ffi_process_pending_requests,
@@ -23,6 +25,7 @@ mod android_smoke {
         irondash_ffi_try_pop_event,
         irondash_ffi_unregister_engine,
         replace_global_api,
+        AndroidFrameBridgeDriver,
         FfiAcquireDecision,
         FfiApi,
         AndroidTextureRegistrationStrategy,
@@ -41,16 +44,18 @@ mod android_smoke {
         AHardwareBuffer_UsageFlags,
     };
     use platform_android::{AndroidPlatformCleaner, AndroidPlatformHandle};
-    use protocol::SourceId;
+    use protocol::{PlatformHandle, SourceId};
+    use request_orchestrator::{BackpressureAction, OrchestratorConfig, RequestOrchestrator};
     use shared_source::SharedSource;
 
     const SMOKE_SOURCE_ID: u64 = 1001;
+    const SMOKE_REJECT_SOURCE_ID: u64 = 1002;
     const SMOKE_WIDTH: i32 = 256;
     const SMOKE_HEIGHT: i32 = 256;
     const SMOKE_BYTES_PER_PIXEL: usize = 4;
 
     static SMOKE_RUNTIME: OnceLock<Arc<FfiApi>> = OnceLock::new();
-    static SMOKE_SESSION: OnceLock<Mutex<Option<SmokeSession>>> = OnceLock::new();
+    static SMOKE_SESSIONS: OnceLock<Mutex<HashMap<i64, SmokeSession>>> = OnceLock::new();
 
     #[derive(Clone, Copy)]
     struct SmokeSession {
@@ -62,12 +67,16 @@ mod android_smoke {
 
     struct AndroidSmokeSourceProvider {
         generation: AtomicU32,
+        source_ids: &'static [u64],
     }
 
+    struct SmokeFailingBridgeDriver;
+
     impl AndroidSmokeSourceProvider {
-        fn new() -> Self {
+        fn new(source_ids: &'static [u64]) -> Self {
             Self {
                 generation: AtomicU32::new(0),
+                source_ids,
             }
         }
 
@@ -78,7 +87,7 @@ mod android_smoke {
 
     impl SourceProvider for AndroidSmokeSourceProvider {
         fn resolve_source(&self, source_id: SourceId) -> Result<Arc<SharedSource>, ResourceError> {
-            if source_id.as_u64() != SMOKE_SOURCE_ID {
+            if !self.source_ids.contains(&source_id.as_u64()) {
                 return Err(ResourceError::SourceNotFound(source_id.to_string()));
             }
 
@@ -86,10 +95,22 @@ mod android_smoke {
         }
     }
 
+    impl AndroidFrameBridgeDriver for SmokeFailingBridgeDriver {
+        fn copy_to_native_window(
+            &self,
+            _handle: PlatformHandle,
+            _native_window: *mut c_void,
+        ) -> Result<(), ResourceError> {
+            Err(ResourceError::PlatformResourceFailed(
+                "smoke bridge failure".into(),
+            ))
+        }
+    }
+
     pub fn acquire_texture(engine_handle: i64) -> Result<i64, String> {
         let _runtime = ensure_runtime();
         info!("Smoke acquire start: engine_handle={}", engine_handle);
-        release_existing_session();
+        release_existing_session(engine_handle);
 
         let register = irondash_ffi_register_engine(engine_handle);
         if !register.success {
@@ -159,10 +180,12 @@ mod android_smoke {
         Ok(texture_id)
     }
 
-    pub fn release_texture(_engine_handle: i64) -> Result<bool, String> {
+    pub fn release_texture(engine_handle: i64) -> Result<bool, String> {
         let _runtime = ensure_runtime();
-        let mut guard = smoke_session().lock().expect("smoke session mutex poisoned");
-        let Some(session) = guard.as_ref().copied() else {
+        let mut guard = smoke_sessions()
+            .lock()
+            .expect("smoke session mutex poisoned");
+        let Some(session) = guard.get(&engine_handle).copied() else {
             return Ok(false);
         };
 
@@ -198,7 +221,7 @@ mod android_smoke {
             release.release_disposition,
             release.error_code
         );
-        if let Some(stored) = guard.as_mut() {
+        if let Some(stored) = guard.get_mut(&engine_handle) {
             stored.released = true;
         }
         drop(guard);
@@ -219,46 +242,282 @@ mod android_smoke {
         ))
     }
 
+    pub fn run_reject_diagnostic(engine_handle: i64) -> Result<String, String> {
+        let _runtime = ensure_runtime();
+        info!(
+            "Smoke reject diagnostic start: engine_handle={}",
+            engine_handle
+        );
+        release_existing_session(engine_handle);
+
+        let diagnostic_api = build_smoke_api(
+            AndroidTextureRegistrationStrategy::HardwareBufferSeam,
+            &[SMOKE_SOURCE_ID, SMOKE_REJECT_SOURCE_ID],
+            Some(1),
+            None,
+        );
+
+        with_swapped_runtime(diagnostic_api, || {
+            let register = irondash_ffi_register_engine(engine_handle);
+            if !register.success {
+                return Err(format!(
+                    "reject diagnostic register_engine failed with error_code={}",
+                    register.error_code
+                ));
+            }
+
+            let first = irondash_ffi_acquire_shared_texture(
+                SMOKE_SOURCE_ID,
+                engine_handle,
+                FfiPriorityCode::Visible as u32,
+            );
+            debug!(
+                "Smoke reject diagnostic first acquire: decision={}, request_id={}, status={}, texture_id={}, error_code={}",
+                first.decision,
+                first.request_id,
+                first.status,
+                first.texture_id,
+                first.error_code
+            );
+            if first.decision != FfiAcquireDecision::Accepted as u32 {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "reject diagnostic expected first acquire to be accepted, got decision={} error_code={}",
+                    first.decision, first.error_code
+                ));
+            }
+
+            let second = irondash_ffi_acquire_shared_texture(
+                SMOKE_REJECT_SOURCE_ID,
+                engine_handle,
+                FfiPriorityCode::Visible as u32,
+            );
+            debug!(
+                "Smoke reject diagnostic second acquire: decision={}, request_id={}, status={}, texture_id={}, error_code={}",
+                second.decision,
+                second.request_id,
+                second.status,
+                second.texture_id,
+                second.error_code
+            );
+            if second.decision != FfiAcquireDecision::Rejected as u32 {
+                let _ = irondash_ffi_cancel_request(first.request_id);
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "reject diagnostic expected second acquire to be rejected, got decision={} error_code={}",
+                    second.decision, second.error_code
+                ));
+            }
+
+            let cancel = irondash_ffi_cancel_request(first.request_id);
+            debug!(
+                "Smoke reject diagnostic cancel result: request_id={}, success={}, status={}, error_code={}",
+                first.request_id,
+                cancel.success,
+                cancel.status,
+                cancel.error_code
+            );
+            drain_events(first.request_id);
+            log_request_state("after reject diagnostic cancel", first.request_id);
+
+            let unregister = irondash_ffi_unregister_engine(engine_handle);
+            debug!(
+                "Smoke reject diagnostic unregister result: engine_handle={}, success={}, is_registered={}, error_code={}",
+                engine_handle,
+                unregister.success,
+                unregister.is_registered,
+                unregister.error_code
+            );
+
+            info!(
+                "Smoke reject diagnostic observed expected rejection: engine_handle={}, accepted_request_id={}, rejected_error_code={}",
+                engine_handle,
+                first.request_id,
+                second.error_code
+            );
+            Ok(format!(
+                "已在真机命中 acquire rejected；accepted_request_id={}，error_code={}。请查看 flutter 日志中的 FFI acquire rejected。",
+                first.request_id,
+                second.error_code
+            ))
+        })
+    }
+
+    pub fn run_bridge_failure_diagnostic(engine_handle: i64) -> Result<String, String> {
+        let _runtime = ensure_runtime();
+        info!(
+            "Smoke bridge-failure diagnostic start: engine_handle={}",
+            engine_handle
+        );
+        release_existing_session(engine_handle);
+
+        let diagnostic_api = build_smoke_api(
+            AndroidTextureRegistrationStrategy::CpuCopyBridge,
+            &[SMOKE_SOURCE_ID],
+            None,
+            Some(Arc::new(SmokeFailingBridgeDriver)),
+        );
+
+        with_swapped_runtime(diagnostic_api, || {
+            let register = irondash_ffi_register_engine(engine_handle);
+            if !register.success {
+                return Err(format!(
+                    "bridge diagnostic register_engine failed with error_code={}",
+                    register.error_code
+                ));
+            }
+
+            let response = irondash_ffi_acquire_shared_texture(
+                SMOKE_SOURCE_ID,
+                engine_handle,
+                FfiPriorityCode::Visible as u32,
+            );
+            debug!(
+                "Smoke bridge-failure diagnostic acquire: decision={}, request_id={}, status={}, texture_id={}, error_code={}",
+                response.decision,
+                response.request_id,
+                response.status,
+                response.texture_id,
+                response.error_code
+            );
+            if response.decision == FfiAcquireDecision::Rejected as u32 {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "bridge diagnostic acquire was unexpectedly rejected with error_code={}",
+                    response.error_code
+                ));
+            }
+
+            let processed = irondash_ffi_process_pending_requests(1);
+            debug!(
+                "Smoke bridge-failure diagnostic processed pending requests: request_id={}, processed={}",
+                response.request_id,
+                processed
+            );
+            drain_events(response.request_id);
+            log_request_state("after bridge failure diagnostic", response.request_id);
+
+            let mut state = FfiRequestStateSnapshot::default();
+            let found = irondash_ffi_get_request_state(response.request_id, &mut state as *mut _);
+            if !found {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "bridge diagnostic could not read request state for request_id={}",
+                    response.request_id
+                ));
+            }
+            if state.status != 5 || state.texture_id < 0 {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "bridge diagnostic expected Registered state after failed bridge, got status={} texture_id={} error_code={}",
+                    state.status, state.texture_id, state.error_code
+                ));
+            }
+
+            let unregister = irondash_ffi_unregister_engine(engine_handle);
+            debug!(
+                "Smoke bridge-failure diagnostic unregister result: engine_handle={}, success={}, is_registered={}, error_code={}",
+                engine_handle,
+                unregister.success,
+                unregister.is_registered,
+                unregister.error_code
+            );
+
+            info!(
+                "Smoke bridge-failure diagnostic observed expected Registered fallback after bridge error: request_id={}, texture_id={}, status={}, error_code={}",
+                response.request_id,
+                state.texture_id,
+                state.status,
+                state.error_code
+            );
+            Ok(format!(
+                "已在真机命中 frame bridge failed；request_id={}，texture_id={}，status={}。请查看 flutter 日志中的 FFI Android frame bridge failed。",
+                response.request_id,
+                state.texture_id,
+                state.status
+            ))
+        })
+    }
+
     fn ensure_runtime() -> Arc<FfiApi> {
         SMOKE_RUNTIME
             .get_or_init(|| {
                 irondash_ffi_init();
-                let api = Arc::new(
-                    FfiApi::builder()
-                        .with_source_provider(Arc::new(AndroidSmokeSourceProvider::new()))
-                        .with_android_texture_registration_strategy(
-                            AndroidTextureRegistrationStrategy::HardwareBufferSeam,
-                        )
-                        .with_event_callback(Arc::new(log_ffi_event))
-                        .build(),
+                debug!(
+                    "Smoke host fixes the Android strategy to HardwareBufferSeam so M0 replays the documented scheme-1 baseline"
+                );
+                let strategy = AndroidTextureRegistrationStrategy::HardwareBufferSeam;
+                let api = build_smoke_api(
+                    strategy,
+                    &[SMOKE_SOURCE_ID],
+                    None,
+                    None,
                 );
                 let _ = replace_global_api(api.clone());
-                info!(
-                    "Smoke runtime initialized with Android zero-copy registration strategy"
-                );
+                debug!("Smoke runtime initialized with Android strategy: {:?}", strategy);
                 api
             })
             .clone()
     }
 
-    fn smoke_session() -> &'static Mutex<Option<SmokeSession>> {
-        SMOKE_SESSION.get_or_init(|| Mutex::new(None))
+    fn build_smoke_api(
+        strategy: AndroidTextureRegistrationStrategy,
+        source_ids: &'static [u64],
+        max_pending_requests: Option<usize>,
+        bridge_driver: Option<Arc<dyn AndroidFrameBridgeDriver>>,
+    ) -> Arc<FfiApi> {
+        let mut builder = FfiApi::builder()
+            .with_source_provider(Arc::new(AndroidSmokeSourceProvider::new(source_ids)))
+            .with_android_texture_registration_strategy(strategy)
+            .with_event_callback(Arc::new(log_ffi_event));
+
+        if let Some(max_pending_requests) = max_pending_requests {
+            let config = OrchestratorConfig {
+                max_pending_requests,
+                backpressure_action: BackpressureAction::Reject,
+                ..OrchestratorConfig::default()
+            };
+            builder = builder.with_orchestrator(RequestOrchestrator::new(config));
+        }
+
+        if let Some(bridge_driver) = bridge_driver {
+            builder = builder.with_android_frame_bridge(bridge_driver);
+        }
+
+        Arc::new(builder.build())
+    }
+
+    fn with_swapped_runtime<T>(
+        diagnostic_api: Arc<FfiApi>,
+        run: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let previous = replace_global_api(diagnostic_api);
+        let result = run();
+        let _ = replace_global_api(previous);
+        result
+    }
+
+    fn smoke_sessions() -> &'static Mutex<HashMap<i64, SmokeSession>> {
+        SMOKE_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
     fn store_session(engine_handle: i64, request_id: u64, texture_id: i64) {
-        let mut guard = smoke_session().lock().expect("smoke session mutex poisoned");
-        *guard = Some(SmokeSession {
+        let mut guard = smoke_sessions().lock().expect("smoke session mutex poisoned");
+        guard.insert(
             engine_handle,
-            request_id,
-            texture_id,
-            released: false,
-        });
+            SmokeSession {
+                engine_handle,
+                request_id,
+                texture_id,
+                released: false,
+            },
+        );
     }
 
-    fn release_existing_session() {
+    fn release_existing_session(engine_handle: i64) {
         let session = {
-            let mut guard = smoke_session().lock().expect("smoke session mutex poisoned");
-            guard.take()
+            let mut guard = smoke_sessions().lock().expect("smoke session mutex poisoned");
+            guard.remove(&engine_handle)
         };
 
         let Some(session) = session else {
@@ -696,6 +955,68 @@ pub extern "C" fn release_texture_example(engine_id: i64, ffi_ptr: *mut c_void, 
         {
             let _ = engine_id;
             port.send(1i64);
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn run_reject_diagnostic_example(engine_id: i64, ffi_ptr: *mut c_void, port: i64) {
+    init_logging();
+    irondash_dart_ffi::irondash_init_ffi(ffi_ptr);
+
+    RunLoop::sender_for_main_thread().unwrap().send(move || {
+        let port = irondash_dart_ffi::DartPort::new(port);
+
+        #[cfg(target_os = "android")]
+        {
+            match android_smoke::run_reject_diagnostic(engine_id) {
+                Ok(message) => {
+                    let _ = port.send(message);
+                }
+                Err(err) => {
+                    error!("Android smoke reject diagnostic failed: {}", err);
+                    let _ = port.send(format!("reject diagnostic failed: {}", err));
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = engine_id;
+            port.send("reject diagnostic is Android-only".to_string());
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn run_bridge_failure_diagnostic_example(
+    engine_id: i64,
+    ffi_ptr: *mut c_void,
+    port: i64,
+) {
+    init_logging();
+    irondash_dart_ffi::irondash_init_ffi(ffi_ptr);
+
+    RunLoop::sender_for_main_thread().unwrap().send(move || {
+        let port = irondash_dart_ffi::DartPort::new(port);
+
+        #[cfg(target_os = "android")]
+        {
+            match android_smoke::run_bridge_failure_diagnostic(engine_id) {
+                Ok(message) => {
+                    let _ = port.send(message);
+                }
+                Err(err) => {
+                    error!("Android smoke bridge diagnostic failed: {}", err);
+                    let _ = port.send(format!("bridge diagnostic failed: {}", err));
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = engine_id;
+            port.send("bridge diagnostic is Android-only".to_string());
         }
     });
 }

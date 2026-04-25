@@ -20,6 +20,16 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 mod jni_sys;
 
+#[repr(C)]
+struct NativeNotifierState {
+    on_notify: unsafe extern "C" fn(
+        state: *mut NativeNotifierState,
+        env: *mut jni_sys::JNIEnv,
+        argument: jobject,
+    ),
+    on_destroy: unsafe extern "C" fn(state: *mut NativeNotifierState),
+}
+
 static mut SHARED_VM: *mut jni_sys::JavaVM = core::ptr::null_mut();
 static mut MAIN_LOOPER: *mut c_void = core::ptr::null_mut();
 static mut CLASS_LOADER: jobject = core::ptr::null_mut();
@@ -74,4 +84,95 @@ pub unsafe extern "C" fn irondash_engine_context_get_class_loader() -> jobject {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn irondash_engine_context_get_main_looper() -> *mut c_void {
     unsafe { MAIN_LOOPER }
+}
+
+unsafe fn get_native_notifier_state(
+    env: *mut jni_sys::JNIEnv,
+    obj: jobject,
+) -> *mut NativeNotifierState {
+    let class = unsafe { (*(*env)).GetObjectClass.unwrap_unchecked()(env, obj) };
+    let field = unsafe {
+        (*(*env)).GetFieldID.unwrap_unchecked()(
+            env,
+            class,
+            b"mNativeData\0".as_ptr() as *const _,
+            b"J\0".as_ptr() as *const _,
+        )
+    };
+
+    if field.is_null() {
+        return core::ptr::null_mut();
+    }
+
+    unsafe { (*(*env)).GetLongField.unwrap_unchecked()(env, obj, field) as *mut NativeNotifierState }
+}
+
+unsafe fn clear_native_notifier_state(env: *mut jni_sys::JNIEnv, obj: jobject) {
+    let class = unsafe { (*(*env)).GetObjectClass.unwrap_unchecked()(env, obj) };
+    let field = unsafe {
+        (*(*env)).GetFieldID.unwrap_unchecked()(
+            env,
+            class,
+            b"mNativeData\0".as_ptr() as *const _,
+            b"J\0".as_ptr() as *const _,
+        )
+    };
+
+    if field.is_null() {
+        return;
+    }
+
+    unsafe {
+        (*(*env)).SetLongField.unwrap_unchecked()(env, obj, field, 0);
+    }
+}
+
+#[no_mangle]
+#[allow(non_snake_case)]
+pub unsafe extern "system" fn Java_dev_irondash_engine_1context_NativeNotifier_onNotify(
+    env: *mut jni_sys::JNIEnv,
+    obj: jobject,
+    argument: jobject,
+) {
+    if env.is_null() {
+        return;
+    }
+
+    let state = unsafe { get_native_notifier_state(env, obj) };
+    if !state.is_null() {
+        unsafe {
+            ((*state).on_notify)(state, env, argument);
+        }
+    }
+}
+
+#[no_mangle]
+#[allow(non_snake_case)]
+pub unsafe extern "system" fn Java_dev_irondash_engine_1context_NativeNotifier_onNotify__Ljava_lang_Object_2(
+    env: *mut jni_sys::JNIEnv,
+    obj: jobject,
+    argument: jobject,
+) {
+    unsafe {
+        Java_dev_irondash_engine_1context_NativeNotifier_onNotify(env, obj, argument);
+    }
+}
+
+#[no_mangle]
+#[allow(non_snake_case)]
+pub unsafe extern "system" fn Java_dev_irondash_engine_1context_NativeNotifier_destroy(
+    env: *mut jni_sys::JNIEnv,
+    obj: jobject,
+) {
+    if env.is_null() {
+        return;
+    }
+
+    let state = unsafe { get_native_notifier_state(env, obj) };
+    if !state.is_null() {
+        unsafe {
+            clear_native_notifier_state(env, obj);
+            ((*state).on_destroy)(state);
+        }
+    }
 }

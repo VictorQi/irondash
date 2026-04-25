@@ -1868,6 +1868,7 @@ dependencies = [
  "oslog",
  "platform-android",
  "protocol",
+ "request-orchestrator",
  "shared-source",
  "simple_logger",
 ]

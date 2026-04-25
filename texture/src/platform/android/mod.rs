@@ -1,7 +1,21 @@
-use std::{cell::RefCell, cmp::min, marker::PhantomData, os::fd::OwnedFd, slice, sync::Arc};
+use std::{
+    cell::RefCell,
+    cmp::min,
+    marker::PhantomData,
+    os::fd::OwnedFd,
+    slice,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+    },
+};
 
 use irondash_engine_context::EngineContext;
-use jni::objects::{GlobalRef, JObject};
+use jni::{
+    objects::{GlobalRef, JClass, JObject, JString},
+    sys::{jboolean, jint},
+    JNIEnv, NativeMethod,
+};
 use ndk_sys::{
     AHardwareBuffer, AHardwareBuffer_Format, AHardwareBuffer_Desc,
     AHardwareBuffer_UsageFlags,
@@ -9,6 +23,13 @@ use ndk_sys::{
     ANativeWindow_fromSurface, ANativeWindow_lock, ANativeWindow_release,
     ANativeWindow_setBuffersGeometry, ANativeWindow_unlockAndPost,
 };
+
+unsafe extern "C" {
+    fn AHardwareBuffer_toHardwareBuffer(
+        env: *mut jni::sys::JNIEnv,
+        hardware_buffer: *mut AHardwareBuffer,
+    ) -> jni::sys::jobject;
+}
 
 // ============================================================================
 // F-04: Android Zero-Copy Extension Seam
@@ -266,18 +287,308 @@ impl AndroidHardwareBufferTextureSource {
 pub struct ImportedHardwareBufferTexture;
 
 const IMPORT_BACKEND_UNAVAILABLE_REASON: &str =
-    "Android hardware-buffer consumer import backend is not implemented in the irondash fork; only the SurfaceTexture/ANativeWindow seam exists";
+    "Android hardware-buffer consumer import backend is unavailable on this runtime";
+const IMPORT_TEXTURE_HELPER_CLASS: &str =
+    "dev.irondash.engine_context.HardwareBufferImportTexture";
+const SURFACE_CLASS: &str = "android/view/Surface";
+const SURFACE_NATIVE_OBJECT_FIELD: &str = "mNativeObject";
+const SURFACE_NATIVE_ATTACH_AND_QUEUE_METHOD: &str =
+    "nativeAttachAndQueueBufferWithColorSpace";
+const SURFACE_NATIVE_ATTACH_AND_QUEUE_SIG: &str =
+    "(JLandroid/hardware/HardwareBuffer;I)I";
+
+struct ImportedHardwareBufferReleaseCallback {
+    provider: Arc<dyn AHardwareBufferFrameProvider>,
+}
+
+struct ImportedHardwareBufferTextureState {
+    provider: Arc<dyn AHardwareBufferFrameProvider>,
+    last_generation: AtomicU64,
+    last_size: RefCell<Option<(i32, i32)>>,
+    _release_callback: Box<ImportedHardwareBufferReleaseCallback>,
+}
 
 impl ImportedHardwareBufferTexture {
     /// Returns whether this fork build can perform real Android consumer import.
     pub fn import_backend_available() -> bool {
-        false
+        let Ok(java_vm) = EngineContext::get_java_vm() else {
+            return false;
+        };
+        let Ok(mut env) = java_vm.attach_current_thread() else {
+            return false;
+        };
+
+        match import_texture_backend_supported(&mut env) {
+            Ok(supported) => supported,
+            Err(_) => {
+                clear_pending_exception(&mut env);
+                false
+            }
+        }
     }
 
     /// Returns the current reason why final-path consumer import is unavailable.
     pub fn unavailable_reason() -> &'static str {
         IMPORT_BACKEND_UNAVAILABLE_REASON
     }
+}
+
+static IMPORT_TEXTURE_NATIVE_REGISTRATION: OnceLock<std::result::Result<(), String>> =
+    OnceLock::new();
+
+fn load_engine_context_class<'a>(env: &mut JNIEnv<'a>, class_name: &str) -> Result<JClass<'a>> {
+    let class_loader = EngineContext::get_class_loader().map_err(Error::from)?;
+    let class = env
+        .call_method(
+            class_loader.as_obj(),
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[(&env.new_string(class_name)?).into()],
+        )?
+        .l()?;
+    Ok(class.into())
+}
+
+fn ensure_import_texture_helper_natives(env: &mut JNIEnv) -> Result<()> {
+    let registration_result = IMPORT_TEXTURE_NATIVE_REGISTRATION.get_or_init(|| {
+        let class =
+            load_engine_context_class(env, IMPORT_TEXTURE_HELPER_CLASS).map_err(|err| err.to_string())?;
+        let methods = [
+            NativeMethod {
+                name: "nativeOnImageReleased".into(),
+                sig: "(JJ)V".into(),
+                fn_ptr: imported_hardware_buffer_texture_on_image_released as *mut _,
+            },
+            NativeMethod {
+                name: "nativeIsSurfaceAttachAndQueueSupported".into(),
+                sig: "()Z".into(),
+                fn_ptr: imported_hardware_buffer_texture_native_is_surface_attach_and_queue_supported
+                    as *mut _,
+            },
+            NativeMethod {
+                name: "nativeAttachAndQueueBufferToSurface".into(),
+                sig: "(Landroid/view/Surface;Landroid/hardware/HardwareBuffer;I)V".into(),
+                fn_ptr: imported_hardware_buffer_texture_native_attach_and_queue_buffer_to_surface
+                    as *mut _,
+            },
+        ];
+
+        env.register_native_methods(class, &methods)
+            .map_err(|err| err.to_string())
+    });
+
+    match registration_result {
+        Ok(()) => Ok(()),
+        Err(reason) => {
+            clear_pending_exception(env);
+            Err(Error::native_registration_failed(Some(reason.clone())))
+        }
+    }
+}
+
+fn import_texture_backend_supported(env: &mut JNIEnv) -> Result<bool> {
+    ensure_import_texture_helper_natives(env)?;
+    let class = match load_engine_context_class(env, IMPORT_TEXTURE_HELPER_CLASS) {
+        Ok(class) => class,
+        Err(error) => {
+            clear_pending_exception(env);
+            return Err(error);
+        }
+    };
+    match env.call_static_method(class, "isSupported", "()Z", &[]) {
+        Ok(value) => match value.z() {
+            Ok(supported) => Ok(supported),
+            Err(error) => {
+                clear_pending_exception(env);
+                Err(Error::from(error))
+            }
+        },
+        Err(error) => {
+            clear_pending_exception(env);
+            Err(Error::from(error))
+        }
+    }
+}
+
+fn import_texture_backend_unavailable_reason(env: &mut JNIEnv) -> Result<String> {
+    ensure_import_texture_helper_natives(env)?;
+    let class = match load_engine_context_class(env, IMPORT_TEXTURE_HELPER_CLASS) {
+        Ok(class) => class,
+        Err(error) => {
+            clear_pending_exception(env);
+            return Err(error);
+        }
+    };
+    let reason = match env.call_static_method(class, "unavailableReason", "()Ljava/lang/String;", &[]) {
+        Ok(value) => match value.l() {
+            Ok(reason) => reason,
+            Err(error) => {
+                clear_pending_exception(env);
+                return Err(Error::from(error));
+            }
+        },
+        Err(error) => {
+            clear_pending_exception(env);
+            return Err(Error::from(error));
+        }
+    };
+    if env.is_same_object(&reason, JObject::null())? {
+        return Ok(IMPORT_BACKEND_UNAVAILABLE_REASON.to_string());
+    }
+
+    let reason: JString = reason.into();
+    let reason = env.get_string(&reason)?;
+    Ok(reason.into())
+}
+
+#[allow(non_snake_case)]
+extern "system" fn imported_hardware_buffer_texture_on_image_released(
+    _env: JNIEnv,
+    _class: JClass,
+    native_handle: i64,
+    release_token: i64,
+) {
+    if native_handle == 0 {
+        return;
+    }
+
+    let Ok(release_token) = u64::try_from(release_token) else {
+        return;
+    };
+
+    let callback = unsafe { &*(native_handle as *const ImportedHardwareBufferReleaseCallback) };
+    callback
+        .provider
+        .release_frame(HardwareBufferFrameRelease {
+            release_token,
+            release_fence_fd: None,
+        })
+        .ok_log();
+}
+
+fn surface_attach_and_queue_supported(env: &mut JNIEnv) -> Result<bool> {
+    let surface_class = env.find_class(SURFACE_CLASS)?;
+    env.get_field_id(&surface_class, SURFACE_NATIVE_OBJECT_FIELD, "J")?;
+    env.get_static_method_id(
+        &surface_class,
+        SURFACE_NATIVE_ATTACH_AND_QUEUE_METHOD,
+        SURFACE_NATIVE_ATTACH_AND_QUEUE_SIG,
+    )?;
+    Ok(true)
+}
+
+fn attach_and_queue_buffer_to_surface(
+    env: &mut JNIEnv,
+    surface: &JObject,
+    hardware_buffer: &JObject,
+    color_space_id: jint,
+) -> Result<()> {
+    let native_object = env.get_field(surface, SURFACE_NATIVE_OBJECT_FIELD, "J")?.j()?;
+    if native_object == 0 {
+        return Err(Error::texture_operation_failed(
+            "Surface.mNativeObject was null while importing HardwareBuffer",
+        ));
+    }
+
+    let surface_class = env.find_class(SURFACE_CLASS)?;
+    let result = env
+        .call_static_method(
+            surface_class,
+            SURFACE_NATIVE_ATTACH_AND_QUEUE_METHOD,
+            SURFACE_NATIVE_ATTACH_AND_QUEUE_SIG,
+            &[
+                native_object.into(),
+                hardware_buffer.into(),
+                color_space_id.into(),
+            ],
+        )?
+        .i()?;
+
+    if result != 0 {
+        return Err(Error::texture_operation_failed(format!(
+            "Surface.nativeAttachAndQueueBufferWithColorSpace failed with error code {result}",
+        )));
+    }
+
+    Ok(())
+}
+
+fn clear_pending_exception(env: &mut JNIEnv) {
+    if env.exception_check().unwrap_or(false) {
+        env.exception_clear().ok();
+    }
+}
+
+#[allow(non_snake_case)]
+extern "system" fn imported_hardware_buffer_texture_native_is_surface_attach_and_queue_supported(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    match surface_attach_and_queue_supported(&mut env) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(_) => {
+            clear_pending_exception(&mut env);
+            0
+        }
+    }
+}
+
+#[no_mangle]
+#[allow(non_snake_case)]
+extern "system" fn Java_dev_irondash_engine_1context_HardwareBufferImportTexture_nativeIsSurfaceAttachAndQueueSupported(
+    env: JNIEnv,
+    class: JClass,
+) -> jboolean {
+    imported_hardware_buffer_texture_native_is_surface_attach_and_queue_supported(env, class)
+}
+
+#[allow(non_snake_case)]
+extern "system" fn imported_hardware_buffer_texture_native_attach_and_queue_buffer_to_surface(
+    mut env: JNIEnv,
+    _class: JClass,
+    surface: JObject,
+    hardware_buffer: JObject,
+    color_space_id: jint,
+) {
+    if let Err(error) = attach_and_queue_buffer_to_surface(
+        &mut env,
+        &surface,
+        &hardware_buffer,
+        color_space_id,
+    ) {
+        clear_pending_exception(&mut env);
+        let _ = env.throw_new("java/lang/RuntimeException", error.to_string());
+    }
+}
+
+#[no_mangle]
+#[allow(non_snake_case)]
+extern "system" fn Java_dev_irondash_engine_1context_HardwareBufferImportTexture_nativeAttachAndQueueBufferToSurface(
+    env: JNIEnv,
+    class: JClass,
+    surface: JObject,
+    hardware_buffer: JObject,
+    color_space_id: jint,
+) {
+    imported_hardware_buffer_texture_native_attach_and_queue_buffer_to_surface(
+        env,
+        class,
+        surface,
+        hardware_buffer,
+        color_space_id,
+    )
+}
+
+#[no_mangle]
+#[allow(non_snake_case)]
+extern "system" fn Java_dev_irondash_engine_1context_HardwareBufferImportTexture_nativeOnImageReleased(
+    env: JNIEnv,
+    class: JClass,
+    native_handle: i64,
+    release_token: i64,
+) {
+    imported_hardware_buffer_texture_on_image_released(env, class, native_handle, release_token)
 }
 
 // ============================================================================
@@ -334,11 +645,12 @@ const BYTES_PER_PIXEL: usize = 4;
 pub struct PlatformTexture<Type> {
     id: i64,
     texture_entry: GlobalRef,
-    surface: GlobalRef,
-    native_window: *mut ANativeWindow,
+    surface: Option<GlobalRef>,
+    native_window: Option<*mut ANativeWindow>,
     last_geometry: RefCell<Option<Geometry>>,
     pixel_data_provider: Option<Arc<dyn PayloadProvider<BoxedPixelData>>>,
     hardware_buffer_source: Option<AndroidHardwareBufferTextureSource>,
+    import_state: Option<ImportedHardwareBufferTextureState>,
     _phantom: PhantomData<Type>,
 }
 
@@ -420,17 +732,90 @@ impl<Type> PlatformTexture<Type> {
         let res = Self {
             id,
             texture_entry: env.new_global_ref(texture_entry).map_err(Error::JNIError)?,
-            surface: env.new_global_ref(surface).map_err(Error::JNIError)?,
-            native_window,
+            surface: Some(env.new_global_ref(surface).map_err(Error::JNIError)?),
+            native_window: Some(native_window),
             last_geometry: RefCell::new(None),
             pixel_data_provider: pixel_buffer_provider,
             hardware_buffer_source,
+            import_state: None,
             _phantom: PhantomData {},
         };
         unsafe {
             env.pop_local_frame(&JObject::null())?;
         }
         Ok(res)
+    }
+
+    fn new_imported(
+        engine_handle: i64,
+        frame_provider: Arc<dyn AHardwareBufferFrameProvider>,
+    ) -> Result<Self> {
+        let java_vm = EngineContext::get_java_vm().map_err(|e| match e {
+            irondash_engine_context::Error::InvalidThread => Error::invalid_thread(),
+            irondash_engine_context::Error::InvalidHandle => Error::invalid_handle(),
+            _ => Error::from(e),
+        })?;
+        let mut env = java_vm.attach_current_thread().map_err(Error::JNIError)?;
+        clear_pending_exception(&mut env);
+        let engine_context = EngineContext::get().map_err(Error::from)?;
+        let texture_registry = engine_context.get_texture_registry(engine_handle).map_err(|e| {
+            match e {
+                irondash_engine_context::Error::InvalidThread => Error::invalid_thread(),
+                irondash_engine_context::Error::InvalidHandle => Error::invalid_handle(),
+                _ => Error::from(e),
+            }
+        })?;
+
+        ensure_import_texture_helper_natives(&mut env)?;
+        if !import_texture_backend_supported(&mut env)? {
+            return Err(Error::native_registration_failed(Some(
+                import_texture_backend_unavailable_reason(&mut env)
+                    .unwrap_or_else(|_| IMPORT_BACKEND_UNAVAILABLE_REASON.to_string()),
+            )));
+        }
+
+        log::debug!(
+            "irondash_texture: registering Android HardwareBufferImport texture for engine_handle={engine_handle}"
+        );
+
+        let release_callback = Box::new(ImportedHardwareBufferReleaseCallback {
+            provider: frame_provider.clone(),
+        });
+        let native_handle = release_callback.as_ref() as *const _ as i64;
+
+        env.push_local_frame(32)?;
+        let helper_result = (|| -> Result<(GlobalRef, i64)> {
+            let helper_class = load_engine_context_class(&mut env, IMPORT_TEXTURE_HELPER_CLASS)?;
+            let helper = env.new_object(
+                helper_class,
+                "(Lio/flutter/view/TextureRegistry;J)V",
+                &[texture_registry.as_obj().into(), native_handle.into()],
+            )?;
+            let id = env.call_method(&helper, "id", "()J", &[])?.j()?;
+            let helper_ref = env.new_global_ref(helper).map_err(Error::JNIError)?;
+            Ok((helper_ref, id))
+        })();
+        unsafe {
+            env.pop_local_frame(&JObject::null())?;
+        }
+        let (helper_ref, id) = helper_result?;
+
+        Ok(Self {
+            id,
+            texture_entry: helper_ref,
+            surface: None,
+            native_window: None,
+            last_geometry: RefCell::new(None),
+            pixel_data_provider: None,
+            hardware_buffer_source: None,
+            import_state: Some(ImportedHardwareBufferTextureState {
+                provider: frame_provider,
+                last_generation: AtomicU64::new(0),
+                last_size: RefCell::new(None),
+                _release_callback: release_callback,
+            }),
+            _phantom: PhantomData {},
+        })
     }
 
     // ========================================================================
@@ -442,10 +827,16 @@ impl<Type> PlatformTexture<Type> {
         // F-05: Check if we're on a valid thread and engine exists
         match java_vm.attach_current_thread() {
             Ok(mut env) => {
-                // Try to release texture entry; ignore errors during teardown
-                let _ = env.call_method(self.texture_entry.as_obj(), "release", "()V", &[]);
-                unsafe {
-                    ANativeWindow_release(self.native_window);
+                if self.import_state.is_some() {
+                    let _ = env.call_method(self.texture_entry.as_obj(), "close", "()V", &[]);
+                } else {
+                    // Try to release texture entry; ignore errors during teardown
+                    let _ = env.call_method(self.texture_entry.as_obj(), "release", "()V", &[]);
+                    if let Some(native_window) = self.native_window.take() {
+                        unsafe {
+                            ANativeWindow_release(native_window);
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -461,14 +852,24 @@ impl<Type> PlatformTexture<Type> {
     pub fn unregister(&mut self) -> Result<()> {
         let java_vm = EngineContext::get_java_vm().map_err(|e| Error::from(e))?;
         let mut env = java_vm.attach_current_thread().map_err(Error::JNIError)?;
-        env.call_method(self.texture_entry.as_obj(), "release", "()V", &[])?;
-        unsafe {
-            ANativeWindow_release(self.native_window);
+        if self.import_state.is_some() {
+            env.call_method(self.texture_entry.as_obj(), "close", "()V", &[])?;
+        } else {
+            env.call_method(self.texture_entry.as_obj(), "release", "()V", &[])?;
+            if let Some(native_window) = self.native_window.take() {
+                unsafe {
+                    ANativeWindow_release(native_window);
+                }
+            }
         }
         Ok(())
     }
 
     pub fn mark_frame_available(&self) -> Result<()> {
+        if let Some(import_state) = self.import_state.as_ref() {
+            return self.queue_imported_hardware_buffer_frame(import_state);
+        }
+
         if let Some(source) = self.hardware_buffer_source.as_ref() {
             self.flush_hardware_buffer_source(source)?;
             return Ok(());
@@ -483,10 +884,15 @@ impl<Type> PlatformTexture<Type> {
                 format: AHardwareBuffer_Format::AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM.0 as i32,
             };
             self.ensure_window_geometry(geometry)?;
+            let native_window = self.native_window.ok_or_else(|| {
+                Error::texture_operation_failed(
+                    "Android pixel-data upload requires a native-window-backed texture",
+                )
+            })?;
             let mut buf: ANativeWindow_Buffer = unsafe { std::mem::zeroed() };
 
             let data = unsafe {
-                ANativeWindow_lock(self.native_window, &mut buf as *mut _, std::ptr::null_mut());
+                ANativeWindow_lock(native_window, &mut buf as *mut _, std::ptr::null_mut());
                 slice::from_raw_parts_mut(
                     buf.bits as *mut u8,
                     (buf.height * buf.stride * 4) as usize,
@@ -511,9 +917,113 @@ impl<Type> PlatformTexture<Type> {
                 }
             }
 
-            unsafe { ANativeWindow_unlockAndPost(self.native_window) };
+            unsafe { ANativeWindow_unlockAndPost(native_window) };
         }
         Ok(())
+    }
+
+    fn queue_imported_hardware_buffer_frame(
+        &self,
+        import_state: &ImportedHardwareBufferTextureState,
+    ) -> Result<()> {
+        let after_generation = import_state.last_generation.load(Ordering::Acquire);
+        let frame = match import_state.provider.acquire_latest_frame(after_generation)? {
+            AcquireFrameOutcome::Acquired(frame) => frame,
+            AcquireFrameOutcome::NoNewFrame { latest_generation } => {
+                if latest_generation > after_generation {
+                    import_state
+                        .last_generation
+                        .store(latest_generation, Ordering::Release);
+                }
+                return Ok(());
+            }
+        };
+
+        let HardwareBufferFrame {
+            buffer,
+            width,
+            height,
+            format,
+            generation,
+            acquire_fence_fd,
+            release_token,
+        } = frame;
+
+        drop(acquire_fence_fd);
+
+        let result = (|| -> Result<()> {
+            if format != AndroidHardwareBufferFormat::Rgba8888 {
+                return Err(Error::texture_operation_failed(format!(
+                    "Android hardware-buffer import currently supports only RGBA8888; got {:?}",
+                    format,
+                )));
+            }
+
+            log::debug!(
+                "irondash_texture: queueing imported hardware buffer frame generation={} size={}x{} release_token={}",
+                generation,
+                width,
+                height,
+                release_token,
+            );
+
+            let java_vm = EngineContext::get_java_vm().map_err(Error::from)?;
+            let mut env = java_vm.attach_current_thread().map_err(Error::JNIError)?;
+            let width = width.max(1);
+            let height = height.max(1);
+            if *import_state.last_size.borrow() != Some((width, height)) {
+                env.call_method(
+                    self.texture_entry.as_obj(),
+                    "setSize",
+                    "(II)V",
+                    &[width.into(), height.into()],
+                )?;
+                import_state.last_size.replace(Some((width, height)));
+            }
+
+            env.push_local_frame(16)?;
+            let queue_result = (|| -> Result<()> {
+                let hardware_buffer_obj = unsafe {
+                    AHardwareBuffer_toHardwareBuffer(env.get_native_interface(), buffer.as_raw())
+                };
+                if hardware_buffer_obj.is_null() {
+                    return Err(Error::texture_operation_failed(
+                        "AHardwareBuffer_toHardwareBuffer returned null",
+                    ));
+                }
+                let hardware_buffer_obj = unsafe { JObject::from_raw(hardware_buffer_obj) };
+                env.call_method(
+                    self.texture_entry.as_obj(),
+                    "queueHardwareBuffer",
+                    "(Landroid/hardware/HardwareBuffer;J)V",
+                    &[(&hardware_buffer_obj).into(), (release_token as i64).into()],
+                )?;
+                Ok(())
+            })();
+            unsafe {
+                env.pop_local_frame(&JObject::null())?;
+            }
+            queue_result
+        })();
+
+        match result {
+            Ok(()) => {
+                import_state
+                    .last_generation
+                    .store(generation, Ordering::Release);
+                Ok(())
+            }
+            Err(error) => {
+                import_state
+                    .provider
+                    .release_frame(HardwareBufferFrameRelease {
+                        release_token,
+                        release_fence_fd: None,
+                    })
+                    .ok_log();
+                Err(error)
+            }
+        }
     }
 
     fn ensure_window_geometry(&self, geometry: Geometry) -> Result<()> {
@@ -522,9 +1032,15 @@ impl<Type> PlatformTexture<Type> {
             return Ok(());
         }
 
+        let native_window = self.native_window.ok_or_else(|| {
+            Error::texture_operation_failed(
+                "Android native-window geometry update requires a native-window-backed texture",
+            )
+        })?;
+
         let status = unsafe {
             ANativeWindow_setBuffersGeometry(
-                self.native_window,
+                native_window,
                 geometry.width,
                 geometry.height,
                 geometry.format,
@@ -616,8 +1132,13 @@ impl<Type> PlatformTexture<Type> {
         }
 
         let mut window_buffer = unsafe { std::mem::zeroed::<ANativeWindow_Buffer>() };
+        let native_window = self.native_window.ok_or_else(|| {
+            Error::texture_operation_failed(
+                "Android hardware-buffer flush requires a native-window-backed texture",
+            )
+        })?;
         let window_lock_status = unsafe {
-            ANativeWindow_lock(self.native_window, &mut window_buffer, std::ptr::null_mut())
+            ANativeWindow_lock(native_window, &mut window_buffer, std::ptr::null_mut())
         };
         if window_lock_status != 0 {
             let _ = unlock_hardware_buffer(buffer.as_raw());
@@ -627,7 +1148,7 @@ impl<Type> PlatformTexture<Type> {
         }
         if window_buffer.bits.is_null() {
             let _ = unlock_hardware_buffer(buffer.as_raw());
-            let _ = unsafe { ANativeWindow_unlockAndPost(self.native_window) };
+            let _ = unsafe { ANativeWindow_unlockAndPost(native_window) };
             return Err(Error::texture_operation_failed(
                 "ANativeWindow_lock returned a null data pointer",
             ));
@@ -641,7 +1162,7 @@ impl<Type> PlatformTexture<Type> {
             &window_buffer,
         );
         let source_unlock_result = unlock_hardware_buffer(buffer.as_raw());
-        let window_unlock_status = unsafe { ANativeWindow_unlockAndPost(self.native_window) };
+        let window_unlock_status = unsafe { ANativeWindow_unlockAndPost(native_window) };
 
         match copy_result {
             Ok(()) => {
@@ -779,12 +1300,10 @@ impl PlatformTexture<NativeWindow> {
 
 impl PlatformTexture<ImportedHardwareBufferTexture> {
     pub fn new_with_hardware_buffer_frame_source(
-        _engine_handle: i64,
-        _provider: Arc<dyn AHardwareBufferFrameProvider>,
+        engine_handle: i64,
+        provider: Arc<dyn AHardwareBufferFrameProvider>,
     ) -> Result<PlatformTexture<ImportedHardwareBufferTexture>> {
-        Err(Error::native_registration_failed(Some(
-            ImportedHardwareBufferTexture::unavailable_reason().into(),
-        )))
+        PlatformTexture::new_imported(engine_handle, provider)
     }
 }
 
@@ -835,7 +1354,11 @@ impl PlatformTextureWithoutProvider for NativeWindow {
     }
 
     fn get(texture: &PlatformTexture<Self>) -> Self {
-        Self::new(texture.native_window)
+        Self::new(
+            texture
+                .native_window
+                .expect("native-window-backed texture must retain ANativeWindow"),
+        )
     }
 }
 
@@ -847,6 +1370,12 @@ impl PlatformTextureWithoutProvider for Surface {
     }
 
     fn get(texture: &PlatformTexture<Self>) -> Self {
-        Self(texture.surface.clone())
+        Self(
+            texture
+                .surface
+                .as_ref()
+                .expect("surface-backed texture must retain Surface")
+                .clone(),
+        )
     }
 }

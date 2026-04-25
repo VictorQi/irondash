@@ -87,6 +87,17 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 2. 用 `--use-application-binary` 启动已验证 APK 重放基线
 3. 只有在 host / Rust / JNI 链改动后才重新 `flutter clean && flutter build apk`
 
+## 最小回归顺序
+
+后续如果改动落在 `ffi-api`、`engine-texture-registry`、Android seam/baseline 状态机，先跑下面这组最小回归，再决定要不要扩大范围：
+
+1. 先跑 `cd /Volumes/VictorOutter/docs/DesignDocs/code-base && cargo test -p ffi-api-boundary -- --nocapture`。
+2. 确认这组 focused tests 仍覆盖 `duplicate acquire`、`release -> reacquire`、`engine gone`、`bridge success/failure`、`fallback 保持 Registered` 语义。
+3. 然后执行 `adb start-server && adb devices`，确认真机仍在线。
+4. 再用 `flutter run -d <android-device-id> --use-application-binary build/app/outputs/flutter-apk/app-debug.apk` 复用已验证 APK 重放单宿主 smoke。
+
+如果改动没有触及 Rust host / JNI 打包链，这就是默认的最小回归；不要先做 `flutter clean` 或重走全量 APK 构建链。
+
 ## 手动验收
 
 满足下面几条即可视为 smoke 通过：
