@@ -21,6 +21,7 @@ jni = "0.21.1"
 android_logger = "0.11"
 ndk-sys = "0.4.1"
 libc = "0.2"
+engine-texture-registry = { path = "../../../../crates/engine-texture-registry" }
 error-model = { path = "../../../../crates/error-model" }
 ffi-api = { path = "../../../../crates/ffi-api" }
 platform-android = { path = "../../../../crates/platform-android" }

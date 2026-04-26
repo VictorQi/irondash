@@ -7,12 +7,25 @@ use log::error;
 
 #[cfg(target_os = "android")]
 mod android_smoke {
-    use std::collections::HashMap;
+    use super::RunLoop;
+    use std::collections::{HashMap, HashSet};
+    use std::fs;
     use std::ffi::c_void;
     use std::slice;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Instant;
 
+    use engine_texture_registry::{
+        AndroidHardwareBufferDeliveryStatus,
+        AndroidHardwareBufferSourceKind,
+        AndroidTextureBridgeStatus,
+        AndroidTextureDeliveryMode,
+        EngineTextureRegistrationDescriptor,
+        EngineTextureRegistrationRequest,
+        InitialTextureAvailability,
+        RegisteredTextureInfo,
+    };
     use error_model::ResourceError;
     use ffi_api::{
         irondash_ffi_acquire_shared_texture,
@@ -37,7 +50,9 @@ mod android_smoke {
         FfiPriorityCode,
         FfiReleaseDisposition,
         FfiRequestStateSnapshot,
+        FfiRuntimeMetricsSnapshot,
         SourceProvider,
+        TextureRegistryStore,
     };
     use libc::close;
     use log::{debug, info, warn};
@@ -46,7 +61,7 @@ mod android_smoke {
         AHardwareBuffer_UsageFlags,
     };
     use platform_android::{AndroidPlatformCleaner, AndroidPlatformHandle};
-    use protocol::{PlatformHandle, SourceId, SourceLifecycleState};
+    use protocol::{EngineHandle, PlatformHandle, SourceId, SourceLifecycleState, TextureId};
     use request_orchestrator::{BackpressureAction, OrchestratorConfig, RequestOrchestrator};
     use resource_manager::{ResourceManager, ResourceManagerConfig, SourceReleaseStatus};
     use shared_source::SharedSource;
@@ -62,6 +77,11 @@ mod android_smoke {
     const SMOKE_ENGINE_GONE_PENDING_SOURCE_ID: u64 = 1106;
     const SMOKE_CANCEL_MIDFLIGHT_SOURCE_ID: u64 = 1107;
     const SMOKE_LIFECYCLE_SOURCE_IDS: [u64; 3] = [1201, 1202, 1203];
+    const SMOKE_STRESS_CYCLE_SOURCE_ID: u64 = 1301;
+    const SMOKE_FLICKER_SOURCE_ID: u64 = 1302;
+    const SMOKE_CONCURRENT_SOURCE_ID: u64 = 1303;
+    const SMOKE_STRESS_CYCLE_COUNT: usize = 100;
+    const SMOKE_FLICKER_CYCLE_COUNT: usize = 24;
     const SMOKE_WIDTH: i32 = 256;
     const SMOKE_HEIGHT: i32 = 256;
     const SMOKE_BYTES_PER_PIXEL: usize = 4;
@@ -106,12 +126,58 @@ mod android_smoke {
         latest_generation: u32,
     }
 
+    #[derive(Clone, Default)]
+    struct SmokeLiveMetrics {
+        registration_strategy: String,
+        delivery_path: String,
+        copy_bytes: Option<usize>,
+        platform_thread_ms: Option<u64>,
+        acquire_to_ready_ms: Option<u64>,
+        release_ms: Option<u64>,
+        release_to_ready_ms: Option<u64>,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct SmokeMetricDelta {
+        texture_registrations: usize,
+        backpressure_rejections: usize,
+        acquire_accepted_total: usize,
+        acquire_reused_total: usize,
+        acquire_rejected_total: usize,
+        texture_ready_total: usize,
+        request_resumed_total: usize,
+        resource_released_total: usize,
+    }
+
+    #[derive(Default)]
+    struct SmokeRecordingRegistryState {
+        textures_by_engine_source: HashMap<(i64, u64), i64>,
+        source_by_engine_texture: HashMap<(i64, i64), u64>,
+    }
+
+    #[derive(Default)]
+    struct SmokeRecordingRegistryStore {
+        next_texture_id: AtomicI64,
+        state: Mutex<SmokeRecordingRegistryState>,
+        unique_registrations: AtomicUsize,
+        duplicate_registrations: AtomicUsize,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct SmokeRecordingRegistrySnapshot {
+        active_texture_count: usize,
+        unique_registrations: usize,
+        duplicate_registrations: usize,
+    }
+
     #[derive(Default)]
     struct SmokeDiagnosticsState {
         last_request_by_engine: HashMap<i64, TrackedRequest>,
         last_event_by_engine: HashMap<i64, SmokeEventSummary>,
         recent_events_by_request: HashMap<u64, Vec<SmokeEventSummary>>,
         source_summary_by_id: HashMap<u64, SmokeSourceSummary>,
+        live_metrics_by_engine: HashMap<i64, SmokeLiveMetrics>,
+        last_release_completed_at_by_engine: HashMap<i64, Instant>,
     }
 
     struct AndroidSmokeSourceProvider {
@@ -159,8 +225,119 @@ mod android_smoke {
         }
     }
 
+    impl SmokeRecordingRegistryStore {
+        fn snapshot(&self) -> SmokeRecordingRegistrySnapshot {
+            let state = self.state.lock().expect("smoke registry mutex poisoned");
+            SmokeRecordingRegistrySnapshot {
+                active_texture_count: state.source_by_engine_texture.len(),
+                unique_registrations: self.unique_registrations.load(Ordering::Relaxed),
+                duplicate_registrations: self.duplicate_registrations.load(Ordering::Relaxed),
+            }
+        }
+    }
+
+    impl TextureRegistryStore for SmokeRecordingRegistryStore {
+        fn register_texture(
+            &self,
+            engine_handle: EngineHandle,
+            source: Arc<SharedSource>,
+            resource_manager: &ResourceManager,
+        ) -> Result<RegisteredTextureInfo, ResourceError> {
+            self.register_texture_with_request(
+                engine_handle,
+                source,
+                resource_manager,
+                EngineTextureRegistrationRequest::Default,
+            )
+        }
+
+        fn register_texture_with_request(
+            &self,
+            engine_handle: EngineHandle,
+            source: Arc<SharedSource>,
+            _resource_manager: &ResourceManager,
+            request: EngineTextureRegistrationRequest,
+        ) -> Result<RegisteredTextureInfo, ResourceError> {
+            let source_id = source.source_id().as_u64();
+            let engine_raw = engine_handle.as_i64();
+
+            let texture_id = {
+                let mut state = self.state.lock().expect("smoke registry mutex poisoned");
+                if let Some(existing) = state
+                    .textures_by_engine_source
+                    .get(&(engine_raw, source_id))
+                    .copied()
+                {
+                    self.duplicate_registrations.fetch_add(1, Ordering::Relaxed);
+                    existing
+                } else {
+                    let next = self.next_texture_id.fetch_add(1, Ordering::AcqRel);
+                    state
+                        .textures_by_engine_source
+                        .insert((engine_raw, source_id), next);
+                    state
+                        .source_by_engine_texture
+                        .insert((engine_raw, next), source_id);
+                    self.unique_registrations.fetch_add(1, Ordering::Relaxed);
+                    next
+                }
+            };
+
+            Ok(RegisteredTextureInfo {
+                texture_id: TextureId::new(texture_id),
+                registration_descriptor: registration_descriptor_for_request(request),
+                availability: availability_for_request(request),
+            })
+        }
+
+        fn unregister_texture(
+            &self,
+            engine_handle: EngineHandle,
+            texture_id: TextureId,
+        ) -> Result<(), ResourceError> {
+            let mut state = self.state.lock().expect("smoke registry mutex poisoned");
+            if let Some(source_id) = state
+                .source_by_engine_texture
+                .remove(&(engine_handle.as_i64(), texture_id.as_i64()))
+            {
+                state
+                    .textures_by_engine_source
+                    .remove(&(engine_handle.as_i64(), source_id));
+            }
+            Ok(())
+        }
+
+        fn unregister_engine(&self, engine_handle: EngineHandle) -> Result<(), ResourceError> {
+            let engine_raw = engine_handle.as_i64();
+            let mut state = self.state.lock().expect("smoke registry mutex poisoned");
+
+            let texture_keys = state
+                .source_by_engine_texture
+                .keys()
+                .filter(|(tracked_engine, _)| *tracked_engine == engine_raw)
+                .copied()
+                .collect::<Vec<_>>();
+            for key in texture_keys {
+                state.source_by_engine_texture.remove(&key);
+            }
+
+            let source_keys = state
+                .textures_by_engine_source
+                .keys()
+                .filter(|(tracked_engine, _)| *tracked_engine == engine_raw)
+                .copied()
+                .collect::<Vec<_>>();
+            for key in source_keys {
+                state.textures_by_engine_source.remove(&key);
+            }
+
+            Ok(())
+        }
+    }
+
     pub fn acquire_texture(engine_handle: i64) -> Result<i64, String> {
         let _runtime = ensure_runtime();
+        let acquire_started = Instant::now();
         info!("Smoke acquire start: engine_handle={}", engine_handle);
         release_existing_session(engine_handle);
 
@@ -202,6 +379,13 @@ mod android_smoke {
         track_request(engine_handle, response.request_id, SMOKE_SOURCE_ID);
 
         if response.texture_id >= 0 {
+            record_ready_metrics(
+                engine_handle,
+                "HardwareBufferSeam",
+                "HardwareBufferSeam",
+                0,
+                acquire_started.elapsed().as_millis() as u64,
+            );
             store_session(
                 engine_handle,
                 SMOKE_SOURCE_ID,
@@ -216,6 +400,7 @@ mod android_smoke {
             return Ok(response.texture_id);
         }
 
+        let platform_started = Instant::now();
         let processed = irondash_ffi_process_pending_requests(1);
         log_request_state("after acquire submit", response.request_id);
         debug!(
@@ -230,6 +415,14 @@ mod android_smoke {
                 response.request_id
             )
         })?;
+
+        record_ready_metrics(
+            engine_handle,
+            "HardwareBufferSeam",
+            "HardwareBufferSeam",
+            platform_started.elapsed().as_millis() as u64,
+            acquire_started.elapsed().as_millis() as u64,
+        );
 
         store_session(engine_handle, SMOKE_SOURCE_ID, response.request_id, texture_id);
         info!(
@@ -265,6 +458,7 @@ mod android_smoke {
             session.texture_id
         );
 
+        let release_started = Instant::now();
         let release = irondash_ffi_release_texture(session.request_id, session.engine_handle);
         if release.error_code != 0 {
             return Err(format!(
@@ -272,6 +466,7 @@ mod android_smoke {
                 session.request_id, release.error_code
             ));
         }
+        record_release_metrics(engine_handle, release_started.elapsed().as_millis() as u64);
         log_request_state("after release_texture", session.request_id);
         debug!(
             "Smoke release result: request_id={}, texture_id={}, release_disposition={}, error_code={}",
@@ -302,7 +497,8 @@ mod android_smoke {
     }
 
     pub fn fetch_snapshot(engine_handle: i64) -> String {
-        let _runtime = ensure_runtime();
+        let runtime = ensure_runtime();
+        let runtime_metrics = runtime.runtime_metrics_snapshot();
 
         let session = smoke_sessions()
             .lock()
@@ -329,6 +525,7 @@ mod android_smoke {
             .and_then(|source_id| diagnostics_source_summary(source_id));
         let request_events = request_id
             .and_then(recent_request_events);
+        let live_metrics = live_metrics_for_engine(engine_handle);
 
         let request_line = match request_state {
             Some(state) => format!(
@@ -377,9 +574,22 @@ mod android_smoke {
         };
 
         format!(
-            "engine_handle={}\nregistration_strategy=HardwareBufferSeam\ndelivery_path=AndroidHardwareBufferSeam\nsource_bytes={}\nsource_id={}\nrequest_id={}\nactive_session={}\nreleased={}\n{}\n{}\n{}\n{}",
+            "engine_handle={}\nregistration_strategy={}\ndelivery_path={}\ncopy_bytes={}\nsource_bytes={}\nplatform_thread_ms={}\nacquire_to_ready_ms={}\nrelease_ms={}\nrelease_to_ready_ms={}\nshared_source_count={}\nactive_borrow_count={}\ncache_bytes_used={}\nrequest_inflight_count={}\nbackpressure_rejection_count={}\ntexture_registrations={}\nsource_id={}\nrequest_id={}\nactive_session={}\nreleased={}\n{}\n{}\n{}\n{}",
             engine_handle,
+            display_metric_label(live_metrics.as_ref().map(|metrics| metrics.registration_strategy.as_str())),
+            display_metric_label(live_metrics.as_ref().map(|metrics| metrics.delivery_path.as_str())),
+            display_optional_usize(live_metrics.as_ref().and_then(|metrics| metrics.copy_bytes)),
             (SMOKE_WIDTH as usize) * (SMOKE_HEIGHT as usize) * SMOKE_BYTES_PER_PIXEL,
+            display_optional_u64(live_metrics.as_ref().and_then(|metrics| metrics.platform_thread_ms)),
+            display_optional_u64(live_metrics.as_ref().and_then(|metrics| metrics.acquire_to_ready_ms)),
+            display_optional_u64(live_metrics.as_ref().and_then(|metrics| metrics.release_ms)),
+            display_optional_u64(live_metrics.as_ref().and_then(|metrics| metrics.release_to_ready_ms)),
+            runtime_metrics.shared_source_count,
+            runtime_metrics.active_borrow_count,
+            runtime_metrics.cached_bytes,
+            runtime_metrics.request_inflight_count,
+            runtime_metrics.backpressure_rejections,
+            runtime_metrics.texture_registrations,
             display_optional_u64(source_id),
             display_optional_u64(request_id),
             session.is_some(),
@@ -1271,6 +1481,554 @@ mod android_smoke {
         })
     }
 
+    pub fn run_p2_stress_diagnostic(engine_handle: i64) -> Result<String, String> {
+        let _runtime = ensure_runtime();
+
+        let rapid_cycle = run_rapid_cycle_stress(engine_handle)?;
+        let visibility_flicker = run_visibility_flicker_stress(engine_handle)?;
+        let concurrent_multi_engine = run_concurrent_multi_engine_stress(engine_handle)?;
+
+        Ok(format!(
+            "p2_stress=PASS\n\n[Rapid Acquire/Release]\n{}\n\n[Visibility Flicker]\n{}\n\n[Concurrent Multi-Engine Miss]\n{}",
+            rapid_cycle,
+            visibility_flicker,
+            concurrent_multi_engine,
+        ))
+    }
+
+    fn run_rapid_cycle_stress(seed_engine_handle: i64) -> Result<String, String> {
+        let registry_store = Arc::new(SmokeRecordingRegistryStore::default());
+        let diagnostic_api = build_smoke_api_with_registry(
+            AndroidTextureRegistrationStrategy::HardwareBufferSeam,
+            &[SMOKE_STRESS_CYCLE_SOURCE_ID],
+            None,
+            None,
+            Some(registry_store.clone()),
+        );
+        let diagnostic_engine_handle = synthetic_engine_handle(seed_engine_handle, 10_001);
+
+        with_swapped_runtime(diagnostic_api.clone(), || {
+            let register = irondash_ffi_register_engine(diagnostic_engine_handle);
+            if !register.success {
+                return Err(format!(
+                    "rapid-cycle diagnostic register_engine failed with error_code={}",
+                    register.error_code
+                ));
+            }
+
+            let metrics_before = diagnostic_api.runtime_metrics_snapshot();
+            let rss_before_kb = current_rss_kb().ok_or_else(|| {
+                "rapid-cycle diagnostic could not read /proc/self/status VmRSS".to_string()
+            })?;
+            let fd_before = current_fd_count().ok_or_else(|| {
+                "rapid-cycle diagnostic could not enumerate /proc/self/fd".to_string()
+            })?;
+
+            let mut request_ids = HashSet::new();
+            let mut texture_ids = HashSet::new();
+
+            for cycle in 0..SMOKE_STRESS_CYCLE_COUNT {
+                let acquire = irondash_ffi_acquire_shared_texture(
+                    SMOKE_STRESS_CYCLE_SOURCE_ID,
+                    diagnostic_engine_handle,
+                    FfiPriorityCode::Visible as u32,
+                );
+                if acquire.decision != FfiAcquireDecision::Accepted as u32 {
+                    let _ = irondash_ffi_unregister_engine(diagnostic_engine_handle);
+                    return Err(format!(
+                        "rapid-cycle diagnostic expected acquire accepted at cycle {}, got decision={} error_code={}",
+                        cycle,
+                        acquire.decision,
+                        acquire.error_code
+                    ));
+                }
+                request_ids.insert(acquire.request_id);
+                let _ = drain_event_records();
+
+                let (_, ready_state, ready_events) =
+                    drive_request_to_ready(acquire.request_id, 2)?;
+                if ready_state.status != 6 || ready_state.texture_id < 0 {
+                    let _ = irondash_ffi_unregister_engine(diagnostic_engine_handle);
+                    return Err(format!(
+                        "rapid-cycle diagnostic expected Ready at cycle {}, got status={} texture_id={} events={}",
+                        cycle,
+                        ready_state.status,
+                        ready_state.texture_id,
+                        format_event_records(&ready_events)
+                    ));
+                }
+                texture_ids.insert(ready_state.texture_id);
+
+                let release =
+                    irondash_ffi_release_texture(acquire.request_id, diagnostic_engine_handle);
+                let release_events = drain_event_records();
+                let release_state = request_state(acquire.request_id).ok_or_else(|| {
+                    format!(
+                        "rapid-cycle diagnostic could not read release state for request_id={}",
+                        acquire.request_id
+                    )
+                })?;
+                if release.error_code != 0 || release_state.status != 9 {
+                    let _ = irondash_ffi_unregister_engine(diagnostic_engine_handle);
+                    return Err(format!(
+                        "rapid-cycle diagnostic expected Unloaded at cycle {}, got error_code={} status={} events={}",
+                        cycle,
+                        release.error_code,
+                        release_state.status,
+                        format_event_records(&release_events)
+                    ));
+                }
+            }
+
+            let unregister = irondash_ffi_unregister_engine(diagnostic_engine_handle);
+            if !unregister.success {
+                return Err(format!(
+                    "rapid-cycle diagnostic unregister_engine failed with error_code={}",
+                    unregister.error_code
+                ));
+            }
+            let _ = drain_event_records();
+            flush_platform_cleanup_callbacks(4);
+
+            let rss_after_kb = current_rss_kb().ok_or_else(|| {
+                "rapid-cycle diagnostic could not re-read /proc/self/status VmRSS".to_string()
+            })?;
+            let fd_after = current_fd_count().ok_or_else(|| {
+                "rapid-cycle diagnostic could not re-enumerate /proc/self/fd".to_string()
+            })?;
+            let metrics_after = diagnostic_api.runtime_metrics_snapshot();
+            let delta = metric_delta(metrics_before, metrics_after);
+            let registry_snapshot = registry_store.snapshot();
+            let rss_growth_pct = percent_growth(rss_before_kb, rss_after_kb);
+            let fd_delta = fd_after as isize - fd_before as isize;
+
+            if rss_growth_pct > 5.0
+                || fd_delta > 0
+                || registry_snapshot.active_texture_count != 0
+                || metrics_after.active_borrow_count != 0
+                || metrics_after.request_inflight_count != 0
+            {
+                return Err(format!(
+                    "rapid-cycle diagnostic exceeded stress envelope: rss_growth_pct={:.2}, fd_delta={}, active_textures_after={}, active_borrows_after={}, inflight_after={}",
+                    rss_growth_pct,
+                    fd_delta,
+                    registry_snapshot.active_texture_count,
+                    metrics_after.active_borrow_count,
+                    metrics_after.request_inflight_count,
+                ));
+            }
+
+            Ok(format!(
+                "rapid_cycle=PASS\ncycles={}\nrequest_ids_seen={}\ntexture_ids_seen={}\nrss_before_kb={}\nrss_after_kb={}\nrss_growth_pct={:.2}\nfd_before={}\nfd_after={}\nfd_delta={}\ntexture_registrations_delta={}\nacquire_accepted_delta={}\nacquire_reused_delta={}\nacquire_rejected_delta={}\ntexture_ready_delta={}\nrequest_resumed_delta={}\nbackpressure_rejections_delta={}\nresource_released_delta={}\nactive_textures_after={}\nactive_borrows_after={}\ninflight_after={}",
+                SMOKE_STRESS_CYCLE_COUNT,
+                request_ids.len(),
+                texture_ids.len(),
+                rss_before_kb,
+                rss_after_kb,
+                rss_growth_pct,
+                fd_before,
+                fd_after,
+                fd_delta,
+                delta.texture_registrations,
+                delta.acquire_accepted_total,
+                delta.acquire_reused_total,
+                delta.acquire_rejected_total,
+                delta.texture_ready_total,
+                delta.request_resumed_total,
+                delta.backpressure_rejections,
+                delta.resource_released_total,
+                registry_snapshot.active_texture_count,
+                metrics_after.active_borrow_count,
+                metrics_after.request_inflight_count,
+            ))
+        })
+    }
+
+    fn run_visibility_flicker_stress(seed_engine_handle: i64) -> Result<String, String> {
+        let registry_store = Arc::new(SmokeRecordingRegistryStore::default());
+        let diagnostic_api = build_smoke_api_with_registry(
+            AndroidTextureRegistrationStrategy::HardwareBufferSeam,
+            &[SMOKE_FLICKER_SOURCE_ID],
+            None,
+            None,
+            Some(registry_store.clone()),
+        );
+        let diagnostic_engine_handle = synthetic_engine_handle(seed_engine_handle, 10_002);
+
+        with_swapped_runtime(diagnostic_api.clone(), || {
+            let register = irondash_ffi_register_engine(diagnostic_engine_handle);
+            if !register.success {
+                return Err(format!(
+                    "visibility-flicker diagnostic register_engine failed with error_code={}",
+                    register.error_code
+                ));
+            }
+
+            let metrics_before = diagnostic_api.runtime_metrics_snapshot();
+            let mut ready_transitions = 0usize;
+
+            for cycle in 0..SMOKE_FLICKER_CYCLE_COUNT {
+                let prefetch = irondash_ffi_acquire_shared_texture(
+                    SMOKE_FLICKER_SOURCE_ID,
+                    diagnostic_engine_handle,
+                    FfiPriorityCode::Prefetch as u32,
+                );
+                if prefetch.decision != FfiAcquireDecision::Accepted as u32 {
+                    let _ = irondash_ffi_unregister_engine(diagnostic_engine_handle);
+                    return Err(format!(
+                        "visibility-flicker diagnostic expected prefetch accepted at cycle {}, got decision={} error_code={}",
+                        cycle,
+                        prefetch.decision,
+                        prefetch.error_code
+                    ));
+                }
+                let _ = drain_event_records();
+
+                let release_prefetch =
+                    irondash_ffi_release_texture(prefetch.request_id, diagnostic_engine_handle);
+                let _ = drain_event_records();
+                let _ = irondash_ffi_process_pending_requests(1);
+                let prefetch_followup_events = drain_event_records();
+                let prefetch_state = request_state(prefetch.request_id).ok_or_else(|| {
+                    format!(
+                        "visibility-flicker diagnostic could not read prefetch release state for request_id={}",
+                        prefetch.request_id
+                    )
+                })?;
+                if release_prefetch.error_code != 0 || prefetch_state.status != 9 {
+                    let _ = irondash_ffi_unregister_engine(diagnostic_engine_handle);
+                    return Err(format!(
+                        "visibility-flicker diagnostic expected prefetch release to end in Unloaded at cycle {}, got error_code={} status={} events={}",
+                        cycle,
+                        release_prefetch.error_code,
+                        prefetch_state.status,
+                        format_event_records(&prefetch_followup_events)
+                    ));
+                }
+                if has_event_type(&prefetch_followup_events, FfiEventType::TextureReady as u32) {
+                    let _ = irondash_ffi_unregister_engine(diagnostic_engine_handle);
+                    return Err(format!(
+                        "visibility-flicker diagnostic observed orphan TextureReady after prefetch release at cycle {}: {}",
+                        cycle,
+                        format_event_records(&prefetch_followup_events)
+                    ));
+                }
+
+                let visible = irondash_ffi_acquire_shared_texture(
+                    SMOKE_FLICKER_SOURCE_ID,
+                    diagnostic_engine_handle,
+                    FfiPriorityCode::Visible as u32,
+                );
+                if visible.decision != FfiAcquireDecision::Accepted as u32 {
+                    let _ = irondash_ffi_unregister_engine(diagnostic_engine_handle);
+                    return Err(format!(
+                        "visibility-flicker diagnostic expected visible acquire accepted at cycle {}, got decision={} error_code={}",
+                        cycle,
+                        visible.decision,
+                        visible.error_code
+                    ));
+                }
+                let _ = drain_event_records();
+
+                let (_, visible_state, visible_ready_events) =
+                    drive_request_to_ready(visible.request_id, 2)?;
+                if visible_state.status != 6 || visible_state.texture_id < 0 {
+                    let _ = irondash_ffi_unregister_engine(diagnostic_engine_handle);
+                    return Err(format!(
+                        "visibility-flicker diagnostic expected first visible Ready at cycle {}, got status={} texture_id={} events={}",
+                        cycle,
+                        visible_state.status,
+                        visible_state.texture_id,
+                        format_event_records(&visible_ready_events)
+                    ));
+                }
+                ready_transitions += 1;
+
+                let visible_release =
+                    irondash_ffi_release_texture(visible.request_id, diagnostic_engine_handle);
+                if visible_release.error_code != 0 {
+                    let _ = irondash_ffi_unregister_engine(diagnostic_engine_handle);
+                    return Err(format!(
+                        "visibility-flicker diagnostic first visible release failed at cycle {} with error_code={}",
+                        cycle,
+                        visible_release.error_code
+                    ));
+                }
+                let _ = drain_event_records();
+
+                let visible_again = irondash_ffi_acquire_shared_texture(
+                    SMOKE_FLICKER_SOURCE_ID,
+                    diagnostic_engine_handle,
+                    FfiPriorityCode::HighVisibility as u32,
+                );
+                if visible_again.decision != FfiAcquireDecision::Accepted as u32 {
+                    let _ = irondash_ffi_unregister_engine(diagnostic_engine_handle);
+                    return Err(format!(
+                        "visibility-flicker diagnostic expected visible-again acquire accepted at cycle {}, got decision={} error_code={}",
+                        cycle,
+                        visible_again.decision,
+                        visible_again.error_code
+                    ));
+                }
+                let _ = drain_event_records();
+
+                let (_, visible_again_state, visible_again_events) =
+                    drive_request_to_ready(visible_again.request_id, 2)?;
+                if visible_again_state.status != 6 || visible_again_state.texture_id < 0 {
+                    let _ = irondash_ffi_unregister_engine(diagnostic_engine_handle);
+                    return Err(format!(
+                        "visibility-flicker diagnostic expected second visible Ready at cycle {}, got status={} texture_id={} events={}",
+                        cycle,
+                        visible_again_state.status,
+                        visible_again_state.texture_id,
+                        format_event_records(&visible_again_events)
+                    ));
+                }
+                ready_transitions += 1;
+
+                let visible_again_release =
+                    irondash_ffi_release_texture(visible_again.request_id, diagnostic_engine_handle);
+                if visible_again_release.error_code != 0 {
+                    let _ = irondash_ffi_unregister_engine(diagnostic_engine_handle);
+                    return Err(format!(
+                        "visibility-flicker diagnostic second visible release failed at cycle {} with error_code={}",
+                        cycle,
+                        visible_again_release.error_code
+                    ));
+                }
+                let _ = drain_event_records();
+            }
+
+            let unregister = irondash_ffi_unregister_engine(diagnostic_engine_handle);
+            if !unregister.success {
+                return Err(format!(
+                    "visibility-flicker diagnostic unregister_engine failed with error_code={}",
+                    unregister.error_code
+                ));
+            }
+            let _ = drain_event_records();
+
+            let metrics_after = diagnostic_api.runtime_metrics_snapshot();
+            let delta = metric_delta(metrics_before, metrics_after);
+            let registry_snapshot = registry_store.snapshot();
+            if registry_snapshot.active_texture_count != 0
+                || metrics_after.active_borrow_count != 0
+                || metrics_after.request_inflight_count != 0
+            {
+                return Err(format!(
+                    "visibility-flicker diagnostic left runtime dirty: active_textures_after={}, active_borrows_after={}, inflight_after={}",
+                    registry_snapshot.active_texture_count,
+                    metrics_after.active_borrow_count,
+                    metrics_after.request_inflight_count,
+                ));
+            }
+
+            Ok(format!(
+                "visibility_flicker=PASS\ncycles={}\nready_transitions={}\ntexture_registrations_delta={}\nacquire_accepted_delta={}\nacquire_reused_delta={}\nacquire_rejected_delta={}\ntexture_ready_delta={}\nrequest_resumed_delta={}\nbackpressure_rejections_delta={}\nresource_released_delta={}\nactive_textures_after={}\nactive_borrows_after={}\ninflight_after={}",
+                SMOKE_FLICKER_CYCLE_COUNT,
+                ready_transitions,
+                delta.texture_registrations,
+                delta.acquire_accepted_total,
+                delta.acquire_reused_total,
+                delta.acquire_rejected_total,
+                delta.texture_ready_total,
+                delta.request_resumed_total,
+                delta.backpressure_rejections,
+                delta.resource_released_total,
+                registry_snapshot.active_texture_count,
+                metrics_after.active_borrow_count,
+                metrics_after.request_inflight_count,
+            ))
+        })
+    }
+
+    fn run_concurrent_multi_engine_stress(seed_engine_handle: i64) -> Result<String, String> {
+        let registry_store = Arc::new(SmokeRecordingRegistryStore::default());
+        let diagnostic_api = build_smoke_api_with_registry(
+            AndroidTextureRegistrationStrategy::HardwareBufferSeam,
+            &[SMOKE_CONCURRENT_SOURCE_ID],
+            None,
+            None,
+            Some(registry_store.clone()),
+        );
+        let engine_handles = [
+            synthetic_engine_handle(seed_engine_handle, 10_011),
+            synthetic_engine_handle(seed_engine_handle, 10_012),
+            synthetic_engine_handle(seed_engine_handle, 10_013),
+        ];
+
+        with_swapped_runtime(diagnostic_api.clone(), || {
+            let metrics_before = diagnostic_api.runtime_metrics_snapshot();
+            let resolve_before = diagnostics_source_summary(SMOKE_CONCURRENT_SOURCE_ID)
+                .map(|summary| summary.resolve_count)
+                .unwrap_or_default();
+
+            for engine_handle in engine_handles {
+                let register = irondash_ffi_register_engine(engine_handle);
+                if !register.success {
+                    return Err(format!(
+                        "concurrent multi-engine diagnostic register_engine failed for {} with error_code={}",
+                        engine_handle,
+                        register.error_code
+                    ));
+                }
+            }
+
+            let responses = engine_handles
+                .iter()
+                .map(|engine_handle| {
+                    irondash_ffi_acquire_shared_texture(
+                        SMOKE_CONCURRENT_SOURCE_ID,
+                        *engine_handle,
+                        FfiPriorityCode::Visible as u32,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if responses
+                .iter()
+                .any(|response| response.decision != FfiAcquireDecision::Accepted as u32)
+            {
+                for engine_handle in engine_handles {
+                    let _ = irondash_ffi_unregister_engine(engine_handle);
+                }
+                return Err(format!(
+                    "concurrent multi-engine diagnostic expected all acquires accepted, got {}",
+                    responses
+                        .iter()
+                        .map(|response| format!("decision={} error_code={}", response.decision, response.error_code))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                ));
+            }
+            let _ = drain_event_records();
+
+            let processed = irondash_ffi_process_pending_requests(engine_handles.len());
+            let ready_events = drain_event_records();
+            let ready_states = responses
+                .iter()
+                .map(|response| {
+                    request_state(response.request_id).ok_or_else(|| {
+                        format!(
+                            "concurrent multi-engine diagnostic could not read request state for request_id={}",
+                            response.request_id
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            if ready_states
+                .iter()
+                .any(|state| state.status != 6 || state.texture_id < 0)
+            {
+                for engine_handle in engine_handles {
+                    let _ = irondash_ffi_unregister_engine(engine_handle);
+                }
+                return Err(format!(
+                    "concurrent multi-engine diagnostic expected all requests Ready, got states={} events={}",
+                    ready_states
+                        .iter()
+                        .map(|state| format!("status={} texture_id={}", state.status, state.texture_id))
+                        .collect::<Vec<_>>()
+                        .join(" | "),
+                    format_event_records(&ready_events)
+                ));
+            }
+
+            let resolve_after = diagnostics_source_summary(SMOKE_CONCURRENT_SOURCE_ID)
+                .map(|summary| summary.resolve_count)
+                .unwrap_or_default();
+            let metrics_after_ready = diagnostic_api.runtime_metrics_snapshot();
+            let delta_after_ready = metric_delta(metrics_before, metrics_after_ready);
+            let registry_snapshot = registry_store.snapshot();
+
+            if processed != engine_handles.len()
+                || resolve_after.saturating_sub(resolve_before) != 1
+                || registry_snapshot.unique_registrations != engine_handles.len()
+                || registry_snapshot.duplicate_registrations != 0
+                || delta_after_ready.texture_registrations != engine_handles.len()
+            {
+                for engine_handle in engine_handles {
+                    let _ = irondash_ffi_unregister_engine(engine_handle);
+                }
+                return Err(format!(
+                    "concurrent multi-engine diagnostic failed: processed={}, resolve_count_delta={}, unique_registrations={}, duplicate_registrations={}, texture_registrations_delta={}",
+                    processed,
+                    resolve_after.saturating_sub(resolve_before),
+                    registry_snapshot.unique_registrations,
+                    registry_snapshot.duplicate_registrations,
+                    delta_after_ready.texture_registrations,
+                ));
+            }
+
+            for (engine_handle, response) in engine_handles.iter().zip(responses.iter()) {
+                let release = irondash_ffi_release_texture(response.request_id, *engine_handle);
+                if release.error_code != 0 {
+                    return Err(format!(
+                        "concurrent multi-engine diagnostic release failed for engine {} request {} with error_code={}",
+                        engine_handle,
+                        response.request_id,
+                        release.error_code
+                    ));
+                }
+                let _ = drain_event_records();
+            }
+
+            for engine_handle in engine_handles {
+                let unregister = irondash_ffi_unregister_engine(engine_handle);
+                if !unregister.success {
+                    return Err(format!(
+                        "concurrent multi-engine diagnostic unregister_engine failed for {} with error_code={}",
+                        engine_handle,
+                        unregister.error_code
+                    ));
+                }
+            }
+            let _ = drain_event_records();
+
+            let metrics_after_cleanup = diagnostic_api.runtime_metrics_snapshot();
+            let registry_after_cleanup = registry_store.snapshot();
+            if registry_after_cleanup.active_texture_count != 0
+                || metrics_after_cleanup.active_borrow_count != 0
+                || metrics_after_cleanup.request_inflight_count != 0
+            {
+                return Err(format!(
+                    "concurrent multi-engine diagnostic left runtime dirty: active_textures_after={}, active_borrows_after={}, inflight_after={}",
+                    registry_after_cleanup.active_texture_count,
+                    metrics_after_cleanup.active_borrow_count,
+                    metrics_after_cleanup.request_inflight_count,
+                ));
+            }
+
+            Ok(format!(
+                "concurrent_multi_engine=PASS\nengine_handles={}\nprocessed={}\nresolve_count_delta={}\ntexture_registrations_delta={}\nacquire_accepted_delta={}\nacquire_reused_delta={}\nacquire_rejected_delta={}\ntexture_ready_delta={}\nrequest_resumed_delta={}\nbackpressure_rejections_delta={}\nunique_registrations={}\nduplicate_registrations={}\nready_textures={}\nactive_textures_after={}\nactive_borrows_after={}\ninflight_after={}",
+                engine_handles
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                processed,
+                resolve_after.saturating_sub(resolve_before),
+                delta_after_ready.texture_registrations,
+                delta_after_ready.acquire_accepted_total,
+                delta_after_ready.acquire_reused_total,
+                delta_after_ready.acquire_rejected_total,
+                delta_after_ready.texture_ready_total,
+                delta_after_ready.request_resumed_total,
+                delta_after_ready.backpressure_rejections,
+                registry_snapshot.unique_registrations,
+                registry_snapshot.duplicate_registrations,
+                ready_states
+                    .iter()
+                    .map(|state| state.texture_id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                registry_after_cleanup.active_texture_count,
+                metrics_after_cleanup.active_borrow_count,
+                metrics_after_cleanup.request_inflight_count,
+            ))
+        })
+    }
+
     fn next_lifecycle_generation(
         generations: &mut HashMap<u64, u32>,
         source_id: u64,
@@ -1307,6 +2065,22 @@ mod android_smoke {
         max_pending_requests: Option<usize>,
         bridge_driver: Option<Arc<dyn AndroidFrameBridgeDriver>>,
     ) -> Arc<FfiApi> {
+        build_smoke_api_with_registry(
+            strategy,
+            source_ids,
+            max_pending_requests,
+            bridge_driver,
+            None,
+        )
+    }
+
+    fn build_smoke_api_with_registry(
+        strategy: AndroidTextureRegistrationStrategy,
+        source_ids: &'static [u64],
+        max_pending_requests: Option<usize>,
+        bridge_driver: Option<Arc<dyn AndroidFrameBridgeDriver>>,
+        registry_store: Option<Arc<dyn TextureRegistryStore>>,
+    ) -> Arc<FfiApi> {
         let mut builder = FfiApi::builder()
             .with_source_provider(Arc::new(AndroidSmokeSourceProvider::new(source_ids)))
             .with_android_texture_registration_strategy(strategy)
@@ -1323,6 +2097,10 @@ mod android_smoke {
 
         if let Some(bridge_driver) = bridge_driver {
             builder = builder.with_android_frame_bridge(bridge_driver);
+        }
+
+        if let Some(registry_store) = registry_store {
+            builder = builder.with_registry_store(registry_store);
         }
 
         Arc::new(builder.build())
@@ -1365,6 +2143,55 @@ mod android_smoke {
             .source_summary_by_id
             .get(&source_id)
             .copied()
+    }
+
+    fn live_metrics_for_engine(engine_handle: i64) -> Option<SmokeLiveMetrics> {
+        smoke_diagnostics()
+            .lock()
+            .expect("smoke diagnostics mutex poisoned")
+            .live_metrics_by_engine
+            .get(&engine_handle)
+            .cloned()
+    }
+
+    fn record_ready_metrics(
+        engine_handle: i64,
+        registration_strategy: &str,
+        delivery_path: &str,
+        platform_thread_ms: u64,
+        acquire_to_ready_ms: u64,
+    ) {
+        let release_to_ready_ms = take_release_to_ready_ms(engine_handle);
+        let mut diagnostics = smoke_diagnostics()
+            .lock()
+            .expect("smoke diagnostics mutex poisoned");
+        let entry = diagnostics.live_metrics_by_engine.entry(engine_handle).or_default();
+        entry.registration_strategy = registration_strategy.to_string();
+        entry.delivery_path = delivery_path.to_string();
+        entry.copy_bytes = Some(SMOKE_SOURCE_BYTES);
+        entry.platform_thread_ms = Some(platform_thread_ms);
+        entry.acquire_to_ready_ms = Some(acquire_to_ready_ms);
+        entry.release_to_ready_ms = release_to_ready_ms;
+    }
+
+    fn record_release_metrics(engine_handle: i64, release_ms: u64) {
+        let mut diagnostics = smoke_diagnostics()
+            .lock()
+            .expect("smoke diagnostics mutex poisoned");
+        let entry = diagnostics.live_metrics_by_engine.entry(engine_handle).or_default();
+        entry.release_ms = Some(release_ms);
+        diagnostics
+            .last_release_completed_at_by_engine
+            .insert(engine_handle, Instant::now());
+    }
+
+    fn take_release_to_ready_ms(engine_handle: i64) -> Option<u64> {
+        smoke_diagnostics()
+            .lock()
+            .expect("smoke diagnostics mutex poisoned")
+            .last_release_completed_at_by_engine
+            .remove(&engine_handle)
+            .map(|completed_at| completed_at.elapsed().as_millis() as u64)
     }
 
     fn recent_request_events(request_id: u64) -> Option<Vec<SmokeEventSummary>> {
@@ -1627,6 +2454,114 @@ mod android_smoke {
         }
     }
 
+    fn drive_request_to_ready(
+        request_id: u64,
+        max_pumps: usize,
+    ) -> Result<(usize, FfiRequestStateSnapshot, Vec<FfiEventRecord>), String> {
+        let mut processed_total = 0usize;
+        let mut events = Vec::new();
+
+        for _ in 0..max_pumps {
+            if let Some(state) = request_state(request_id) {
+                if state.status == 6 && state.texture_id >= 0 {
+                    return Ok((processed_total, state, events));
+                }
+            }
+
+            let processed = irondash_ffi_process_pending_requests(1);
+            processed_total += processed;
+            events.extend(drain_event_records());
+
+            if let Some(state) = request_state(request_id) {
+                if state.status == 6 && state.texture_id >= 0 {
+                    return Ok((processed_total, state, events));
+                }
+            }
+
+            if processed == 0 {
+                break;
+            }
+        }
+
+        let state = request_state(request_id).ok_or_else(|| {
+            format!(
+                "request {} never became readable while driving to Ready",
+                request_id
+            )
+        })?;
+        Err(format!(
+            "request {} did not reach Ready after {} pump(s); final_status={} texture_id={} events={}",
+            request_id,
+            processed_total,
+            state.status,
+            state.texture_id,
+            format_event_records(&events)
+        ))
+    }
+
+    fn metric_delta(
+        before: FfiRuntimeMetricsSnapshot,
+        after: FfiRuntimeMetricsSnapshot,
+    ) -> SmokeMetricDelta {
+        SmokeMetricDelta {
+            texture_registrations: after
+                .texture_registrations
+                .saturating_sub(before.texture_registrations),
+            backpressure_rejections: after
+                .backpressure_rejections
+                .saturating_sub(before.backpressure_rejections),
+            acquire_accepted_total: after
+                .acquire_accepted_total
+                .saturating_sub(before.acquire_accepted_total),
+            acquire_reused_total: after
+                .acquire_reused_total
+                .saturating_sub(before.acquire_reused_total),
+            acquire_rejected_total: after
+                .acquire_rejected_total
+                .saturating_sub(before.acquire_rejected_total),
+            texture_ready_total: after
+                .texture_ready_total
+                .saturating_sub(before.texture_ready_total),
+            request_resumed_total: after
+                .request_resumed_total
+                .saturating_sub(before.request_resumed_total),
+            resource_released_total: after
+                .resource_released_total
+                .saturating_sub(before.resource_released_total),
+        }
+    }
+
+    fn synthetic_engine_handle(seed_engine_handle: i64, offset: i64) -> i64 {
+        seed_engine_handle.saturating_add(offset).max(1)
+    }
+
+    fn current_rss_kb() -> Option<u64> {
+        let status = fs::read_to_string("/proc/self/status").ok()?;
+        let rss_line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+        rss_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse::<u64>().ok())
+    }
+
+    fn current_fd_count() -> Option<usize> {
+        fs::read_dir("/proc/self/fd").ok().map(|entries| entries.count())
+    }
+
+    fn flush_platform_cleanup_callbacks(turns: usize) {
+        let run_loop = RunLoop::current();
+        for _ in 0..turns {
+            run_loop.platform_run_loop.poll_once();
+        }
+    }
+
+    fn percent_growth(before: u64, after: u64) -> f64 {
+        if before == 0 {
+            return 0.0;
+        }
+        ((after as f64 - before as f64) / before as f64) * 100.0
+    }
+
     fn status_name(status: u32) -> &'static str {
         match status {
             1 => "Pending",
@@ -1752,6 +2687,10 @@ mod android_smoke {
         value.map(display_u64).unwrap_or_else(|| "-".to_string())
     }
 
+    fn display_optional_usize(value: Option<usize>) -> String {
+        value.map(|value| value.to_string()).unwrap_or_else(|| "-".to_string())
+    }
+
     fn display_i64(value: i64) -> String {
         if value < 0 {
             "-".to_string()
@@ -1760,11 +2699,59 @@ mod android_smoke {
         }
     }
 
+    fn display_metric_label(value: Option<&str>) -> String {
+        value
+            .filter(|value| !value.is_empty())
+            .unwrap_or("-")
+            .to_string()
+    }
+
     fn display_bool(value: Option<bool>) -> &'static str {
         match value {
             Some(true) => "true",
             Some(false) => "false",
             None => "-",
+        }
+    }
+
+    fn registration_descriptor_for_request(
+        request: EngineTextureRegistrationRequest,
+    ) -> EngineTextureRegistrationDescriptor {
+        match request {
+            EngineTextureRegistrationRequest::Default => {
+                EngineTextureRegistrationDescriptor::AndroidNativeWindowTexture {
+                    bridge_status: AndroidTextureBridgeStatus::PendingPlatformBridge,
+                }
+            }
+            EngineTextureRegistrationRequest::AndroidHardwareBufferSeam => {
+                EngineTextureRegistrationDescriptor::AndroidHardwareBufferTexture {
+                    source_kind: AndroidHardwareBufferSourceKind::AHardwareBuffer,
+                    delivery_mode: AndroidTextureDeliveryMode::CpuCopyBridge,
+                    delivery_status: AndroidHardwareBufferDeliveryStatus::FlushOnMarkFrameAvailable,
+                }
+            }
+            EngineTextureRegistrationRequest::AndroidHardwareBufferImport => {
+                EngineTextureRegistrationDescriptor::AndroidHardwareBufferTexture {
+                    source_kind: AndroidHardwareBufferSourceKind::AHardwareBuffer,
+                    delivery_mode: AndroidTextureDeliveryMode::HardwareBufferImport,
+                    delivery_status:
+                        AndroidHardwareBufferDeliveryStatus::ReadyForConsumerImport,
+                }
+            }
+        }
+    }
+
+    fn availability_for_request(
+        request: EngineTextureRegistrationRequest,
+    ) -> InitialTextureAvailability {
+        match request {
+            EngineTextureRegistrationRequest::Default
+            | EngineTextureRegistrationRequest::AndroidHardwareBufferImport => {
+                InitialTextureAvailability::PendingBridge
+            }
+            EngineTextureRegistrationRequest::AndroidHardwareBufferSeam => {
+                InitialTextureAvailability::ReadyForFrameNotification
+            }
         }
     }
 
@@ -2345,6 +3332,39 @@ pub extern "C" fn run_engine_gone_pending_diagnostic_example(
         {
             let _ = engine_id;
             let _ = port.send("engine-gone-pending diagnostic is Android-only".to_string());
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn run_p2_stress_diagnostic_example(
+    engine_id: i64,
+    ffi_ptr: *mut c_void,
+    port: i64,
+) {
+    init_logging();
+    irondash_dart_ffi::irondash_init_ffi(ffi_ptr);
+
+    RunLoop::sender_for_main_thread().unwrap().send(move || {
+        let port = irondash_dart_ffi::DartPort::new(port);
+
+        #[cfg(target_os = "android")]
+        {
+            match android_smoke::run_p2_stress_diagnostic(engine_id) {
+                Ok(message) => {
+                    let _ = port.send(message);
+                }
+                Err(err) => {
+                    error!("Android smoke P2 stress diagnostic failed: {}", err);
+                    let _ = port.send(format!("p2 stress diagnostic failed: {}", err));
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = engine_id;
+            let _ = port.send("p2 stress diagnostic is Android-only".to_string());
         }
     });
 }

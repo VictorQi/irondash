@@ -185,6 +185,23 @@ Future<String> runEngineGonePendingDiagnostic(int engineHandle) async {
   return await port.first as String;
 }
 
+Future<String> runP2StressDiagnostic(int engineHandle) async {
+  final dylib = _loadLibrary();
+  final function = dylib
+      .lookup<NativeFunction<Void Function(Int64, Pointer<Void>, Int64)>>(
+        'run_p2_stress_diagnostic_example',
+      )
+      .asFunction<void Function(int, Pointer<Void>, int)>();
+
+  final port = ReceivePort();
+  function(
+    engineHandle,
+    NativeApi.initializeApiDLData,
+    port.sendPort.nativePort,
+  );
+  return await port.first as String;
+}
+
 Future<String> fetchSmokeSnapshot(int engineHandle) async {
   final dylib = _loadLibrary();
   final function = dylib
@@ -296,12 +313,20 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
   String _status = '等待初始化';
   String _snapshot = '尚无 smoke snapshot';
   String _p1Report = '尚无 P1 诊断结果';
+  String _p2Report = '尚无 P2 诊断结果';
 
   void _appendP1ReportSection(String title, String result) {
     final section = '[$title]\n$result';
     _p1Report = _p1Report == '尚无 P1 诊断结果'
         ? section
         : '[$title]\n$result\n\n$_p1Report';
+  }
+
+  void _appendP2ReportSection(String title, String result) {
+    final section = '[$title]\n$result';
+    _p2Report = _p2Report == '尚无 P2 诊断结果'
+        ? section
+        : '[$title]\n$result\n\n$_p2Report';
   }
 
   Future<void> _runP1Diagnostic({
@@ -339,6 +364,51 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
       setState(() {
         _status = '$reportTitle 失败: $error';
         _appendP1ReportSection(reportTitle, '$reportTitle 失败: $error');
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _runP2Diagnostic({
+    required String statusLabel,
+    required String reportTitle,
+    required Future<String> Function(int engineHandle) invoke,
+    String? snapshotMessage,
+  }) async {
+    int? engineHandle;
+
+    setState(() {
+      _busy = true;
+      _status = statusLabel;
+    });
+
+    try {
+      engineHandle = _engineHandle ?? await EngineContext.instance.getEngineHandle();
+      final result = await invoke(engineHandle);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _engineHandle = engineHandle;
+        _textureId = null;
+        _status = '$reportTitle 已完成；详见下方报告';
+        if (snapshotMessage != null) {
+          _snapshot = snapshotMessage;
+        }
+        _appendP2ReportSection(reportTitle, result);
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _status = '$reportTitle 失败: $error';
+        _appendP2ReportSection(reportTitle, '$reportTitle 失败: $error');
       });
     } finally {
       if (mounted) {
@@ -579,6 +649,67 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
     );
   }
 
+  Future<void> _runP2StressDiagnostic() async {
+    await _runP2Diagnostic(
+      statusLabel: '正在运行 P2 stress suite（rapid cycle、visibility flicker、concurrent multi-engine miss）',
+      reportTitle: 'P2 Stress Suite',
+      invoke: runP2StressDiagnostic,
+      snapshotMessage: 'P2 stress suite 使用 synthetic engine handles + mock registry store；需要时重新 Refresh Snapshot 或 Acquire 回到 live preview。',
+    );
+  }
+
+  Map<String, String> _parseSnapshotFields(String snapshot) {
+    final fields = <String, String>{};
+    for (final rawLine in snapshot.split('\n')) {
+      final line = rawLine.trim();
+      if (line.isEmpty) {
+        continue;
+      }
+      final separator = line.indexOf('=');
+      if (separator <= 0) {
+        continue;
+      }
+      fields[line.substring(0, separator)] = line.substring(separator + 1);
+    }
+    return fields;
+  }
+
+  String _snapshotField(Map<String, String> fields, String key) {
+    final value = fields[key];
+    if (value == null || value.isEmpty) {
+      return '-';
+    }
+    return value;
+  }
+
+  Widget _buildMetricTile(BuildContext context, String label, String value) {
+    final theme = Theme.of(context);
+    return Container(
+      width: 156,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(16),
+        color: theme.colorScheme.surfaceContainerHighest,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            style: theme.textTheme.labelMedium?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            value,
+            style: theme.textTheme.titleSmall,
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _refreshSnapshot({int? engineHandleOverride}) async {
     final engineHandle = engineHandleOverride ?? _engineHandle;
     if (engineHandle == null) {
@@ -650,6 +781,7 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
 
   @override
   Widget build(BuildContext context) {
+    final snapshotFields = _parseSnapshotFields(_snapshot);
     final preview = _textureId == null
         ? const Center(
             child: Text(
@@ -707,6 +839,109 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
               color: Theme.of(context).colorScheme.surfaceContainerHighest,
             ),
             child: preview,
+          ),
+          const SizedBox(height: 20),
+          Card.outlined(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Live Metrics',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'P2 metrics panel 直接从 smoke snapshot 结构化展示当前 delivery path、耗时、cache counters 和最近一次事件。',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 12,
+                    runSpacing: 12,
+                    children: [
+                      _buildMetricTile(
+                        context,
+                        'Delivery Path',
+                        _snapshotField(snapshotFields, 'delivery_path'),
+                      ),
+                      _buildMetricTile(
+                        context,
+                        'Registration',
+                        _snapshotField(snapshotFields, 'registration_strategy'),
+                      ),
+                      _buildMetricTile(
+                        context,
+                        'Copy Bytes',
+                        _snapshotField(snapshotFields, 'copy_bytes'),
+                      ),
+                      _buildMetricTile(
+                        context,
+                        'Platform Thread ms',
+                        _snapshotField(snapshotFields, 'platform_thread_ms'),
+                      ),
+                      _buildMetricTile(
+                        context,
+                        'Acquire -> Ready ms',
+                        _snapshotField(snapshotFields, 'acquire_to_ready_ms'),
+                      ),
+                      _buildMetricTile(
+                        context,
+                        'Release ms',
+                        _snapshotField(snapshotFields, 'release_ms'),
+                      ),
+                      _buildMetricTile(
+                        context,
+                        'Release -> Ready ms',
+                        _snapshotField(snapshotFields, 'release_to_ready_ms'),
+                      ),
+                      _buildMetricTile(
+                        context,
+                        'Shared Sources',
+                        _snapshotField(snapshotFields, 'shared_source_count'),
+                      ),
+                      _buildMetricTile(
+                        context,
+                        'Active Borrows',
+                        _snapshotField(snapshotFields, 'active_borrow_count'),
+                      ),
+                      _buildMetricTile(
+                        context,
+                        'Cache Bytes',
+                        _snapshotField(snapshotFields, 'cache_bytes_used'),
+                      ),
+                      _buildMetricTile(
+                        context,
+                        'Inflight Requests',
+                        _snapshotField(snapshotFields, 'request_inflight_count'),
+                      ),
+                      _buildMetricTile(
+                        context,
+                        'Backpressure Rejects',
+                        _snapshotField(snapshotFields, 'backpressure_rejection_count'),
+                      ),
+                      _buildMetricTile(
+                        context,
+                        'Texture Registrations',
+                        _snapshotField(snapshotFields, 'texture_registrations'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  SelectionArea(
+                    child: Text(
+                      'request_state: ${_snapshotField(snapshotFields, 'request_state')}\n'
+                      'last_event: ${_snapshotField(snapshotFields, 'last_event')}\n'
+                      'request_events: ${_snapshotField(snapshotFields, 'request_events')}',
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            fontFamily: 'monospace',
+                          ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ),
           const SizedBox(height: 20),
           Card.outlined(
@@ -779,6 +1014,36 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
                 ),
               ),
             ),
+          if (widget.showHostLauncher) const SizedBox(height: 20),
+          if (widget.showHostLauncher)
+            Card.outlined(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'P2 Stress Report',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      '这组诊断覆盖 rapid acquire/release、visibility flicker，以及 concurrent multi-engine miss；multi-engine miss 通过 synthetic engine handles + mock registry store 验证单次 source resolve 与多次 texture registration。',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                    const SizedBox(height: 12),
+                    SelectionArea(
+                      child: Text(
+                        _p2Report,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                              fontFamily: 'monospace',
+                            ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           const SizedBox(height: 20),
           Wrap(
             spacing: 12,
@@ -839,13 +1104,18 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
                   onPressed: _busy ? null : _runFullLifecycleDiagnostic,
                   child: const Text('Load Multiple Sources (P1)'),
                 ),
+              if (widget.showHostLauncher)
+                OutlinedButton(
+                  onPressed: _busy ? null : _runP2StressDiagnostic,
+                  child: const Text('Run P2 Stress Suite'),
+                ),
             ],
           ),
           const SizedBox(height: 16),
           Text(
             widget.autoAcquire
-                ? '通过标准：看到预览区域出现彩色条纹/棋盘图案；释放后区域清空；再次 acquire 可重新出现新纹理。'
-                : 'P0 通过标准：Panel A 先 acquire 且 snapshot 显示 request_events 包含 Loading；Panel B 后 acquire 且 snapshot 显示相同 source_id / source_generation、不同 engine_handle、request_events 不含 Loading；注意 texture_id 是 engine-local 值，跨 engine 可重复；随后 release/destroy/recreate 仍可完成隔离验证。',
+                ? '通过标准：看到预览区域出现彩色条纹/棋盘图案；释放后区域清空；再次 acquire 可重新出现新纹理；同时 metrics panel 会更新 delivery path、耗时和 cache counters。'
+                : 'P0/P2 通过标准：Panel A 先 acquire 且 snapshot 显示 request_events 包含 Loading；Panel B 后 acquire 且 snapshot 显示相同 source_id / source_generation、不同 engine_handle、request_events 不含 Loading；同时主页面的 P2 stress suite 会补 rapid cycle、visibility flicker 和 concurrent multi-engine miss 的宿主级报告。',
           ),
         ],
       ),
