@@ -1869,8 +1869,10 @@ dependencies = [
  "platform-android",
  "protocol",
  "request-orchestrator",
+ "resource-manager",
  "shared-source",
  "simple_logger",
+ "thread-dispatcher",
 ]
 
 [[package]]

@@ -104,6 +104,21 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 
 如果需要在单宿主或 multi-engine panel 上核对“同一 source、不同 engine、本地 texture 各自独立但事件链连续”的证据，优先看这个面板，再结合 logcat。
 
+## P1 诊断按钮
+
+主页面现在还新增了一个 `P1 Diagnostic Report` 面板。它不会覆盖 `Smoke Snapshot`，而是把每次运行的 P1 诊断结果按条目追加到报告里。
+
+当前按钮职责如下：
+
+- `Run P1 Control Plane`：覆盖当前仓库已实现的控制面主矩阵，包含 `pause_request -> resume_request -> Ready`、`release-before-ready` 的晚到 `TextureReady` 丢弃、以及 `duplicate acquire -> Reused`。
+- `Run Cancel Mid-Flight`：验证请求仍处于 `Loading` 前沿时执行 `cancel_request` 会停在 `Canceling`，并且后续不再冒出 stray `TextureReady`。
+- `Run Cancel-After-Ready`：验证已完成请求上的 `cancel_request` 现在是 silent no-op，不再把 `Ready` 请求改写成 `Canceling`。
+- `Run Interleaved Pause/Resume`：验证当前仓库实际采用的 `pause_request -> immediate resume_request` 交错路径在单次 pump 后仍能回到 `Ready`。
+- `Run EngineGone Pending`：验证 request 仍处于 `Pending` 时 `unregister_engine` 会清掉跟踪状态，并且后续不再冒出 `TextureReady`。
+- `Load Multiple Sources (P1)`：在 host 内部用小 byte budget 重放 `LRU eviction -> reload -> final release`，并报告 `DeferredDrop` target。`AHardwareBuffer_release` 的最终 release 边界则由 focused test `cargo test -p platform-android test_ahardwarebuffer_release_waits_for_final_release_boundary -- --nocapture` 证明。
+
+注意：当前仓库现在已经提供单独的 `irondash_ffi_pause_request` 和 `RequestPaused` 事件；因此 smoke host 的 pause/resume 诊断不再借用 cancel 语义。`Run Cancel Mid-Flight` 仍保留为独立按钮，用来验证 cancel 和 pause 在控制面上的分工没有混淆。
+
 ## P0 多引擎手动验收
 
 推荐按下面顺序回放：
@@ -128,7 +143,7 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 后续如果改动落在 `ffi-api`、`engine-texture-registry`、Android seam/baseline 状态机，先跑下面这组最小回归，再决定要不要扩大范围：
 
 1. 先跑 `cd /Volumes/VictorOutter/docs/DesignDocs/code-base && cargo test -p ffi-api-boundary -- --nocapture`。
-2. 确认这组 focused tests 仍覆盖 `duplicate acquire`、`release -> reacquire`、`engine gone`、`bridge success/failure`、`fallback 保持 Registered` 语义。
+2. 确认这组 focused tests 仍覆盖 `pause_request -> RequestPaused -> resume_request`、`duplicate acquire`、`release -> reacquire`、`cancel mid-flight` 无 stray ready、`cancel-after-ready no-op`、`release-before-ready` 的晚到 ready 丢弃、`engine gone` / pending request 清理、`bridge success/failure`、`fallback 保持 Registered` 语义；如果改动涉及 Android cleaner/shared-source 最终 release，再额外跑 `cargo test -p platform-android test_ahardwarebuffer_release_waits_for_final_release_boundary -- --nocapture`。
 3. 然后执行 `adb start-server && adb devices`，确认真机仍在线。
 4. 再用 `flutter run -d <android-device-id> --use-application-binary build/app/outputs/flutter-apk/app-debug.apk` 复用已验证 APK 重放单宿主 smoke。
 
@@ -149,6 +164,17 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 6. Panel A 首次 acquire 的 snapshot 含 `Loading`，Panel B cache-hit acquire 的 snapshot 不含 `Loading`。
 7. Panel A `Release Texture` 和 `Destroy Panel A` 都不会让 Panel B 失去 `Ready`。
 8. `Recreate Panel A` 之后再次 acquire 能拿到新的 `engine_handle` / `request_id` 并重新回到 `Loading -> Ready`。
+
+如果要验收当前 P1 host 诊断，再额外满足：
+
+9. `Run P1 Control Plane` 报告里出现 `p1_control_plane=PASS`，并分别列出 `pause_resume_path=pause_request -> resume_request -> Ready`、`pause_events=RequestPaused:Canceling`、`release_before_ready=PASS`、`duplicate_acquire=PASS`。
+10. `Run Cancel Mid-Flight` 报告里出现 `cancel_midflight=PASS`，且 `followup_events=-`。
+11. `Run Cancel-After-Ready` 报告里出现 `cancel_after_ready=PASS`，且 `cancel_events=-`。
+12. `Run Interleaved Pause/Resume` 报告里出现 `interleaved_pause_resume=PASS`，并且 `ready_events` 中仍包含 `TextureReady`。
+13. `Run EngineGone Pending` 报告里出现 `engine_gone_pending=PASS`，且 `request_state_after_unregister=absent`。
+14. `Load Multiple Sources (P1)` 报告里出现 `p1_full_lifecycle=PASS`，并包含 `evicted_source_id`、`reloaded_generation`、`deferred_drop_target`。
+
+补充说明：`AHardwareBuffer_release` 的准确触发时序当前没有直接显示在 UI 报告里；这部分验收依赖 focused `platform-android` test，而不是 smoke host 文本输出。
 
 如果需要额外看 Rust 侧行为，可以打开 logcat，关注 `flutter` tag 下的 smoke 日志。
 

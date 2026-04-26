@@ -20,8 +20,10 @@ mod android_smoke {
         irondash_ffi_get_request_state,
         irondash_ffi_init,
         irondash_ffi_process_pending_requests,
+        irondash_ffi_pause_request,
         irondash_ffi_register_engine,
         irondash_ffi_release_texture,
+        irondash_ffi_resume_request,
         irondash_ffi_try_pop_event,
         irondash_ffi_unregister_engine,
         replace_global_api,
@@ -44,15 +46,27 @@ mod android_smoke {
         AHardwareBuffer_UsageFlags,
     };
     use platform_android::{AndroidPlatformCleaner, AndroidPlatformHandle};
-    use protocol::{PlatformHandle, SourceId};
+    use protocol::{PlatformHandle, SourceId, SourceLifecycleState};
     use request_orchestrator::{BackpressureAction, OrchestratorConfig, RequestOrchestrator};
+    use resource_manager::{ResourceManager, ResourceManagerConfig, SourceReleaseStatus};
     use shared_source::SharedSource;
+    use thread_dispatcher::ThreadTarget;
 
     const SMOKE_SOURCE_ID: u64 = 1001;
     const SMOKE_REJECT_SOURCE_ID: u64 = 1002;
+    const SMOKE_CONTROL_SOURCE_ID: u64 = 1101;
+    const SMOKE_RELEASE_BEFORE_READY_SOURCE_ID: u64 = 1102;
+    const SMOKE_DUPLICATE_SOURCE_ID: u64 = 1103;
+    const SMOKE_CANCEL_AFTER_READY_SOURCE_ID: u64 = 1104;
+    const SMOKE_INTERLEAVED_CONTROL_SOURCE_ID: u64 = 1105;
+    const SMOKE_ENGINE_GONE_PENDING_SOURCE_ID: u64 = 1106;
+    const SMOKE_CANCEL_MIDFLIGHT_SOURCE_ID: u64 = 1107;
+    const SMOKE_LIFECYCLE_SOURCE_IDS: [u64; 3] = [1201, 1202, 1203];
     const SMOKE_WIDTH: i32 = 256;
     const SMOKE_HEIGHT: i32 = 256;
     const SMOKE_BYTES_PER_PIXEL: usize = 4;
+    const SMOKE_SOURCE_BYTES: usize =
+        (SMOKE_WIDTH as usize) * (SMOKE_HEIGHT as usize) * SMOKE_BYTES_PER_PIXEL;
     const MAX_REQUEST_EVENT_HISTORY: usize = 6;
 
     static SMOKE_RUNTIME: OnceLock<Arc<FfiApi>> = OnceLock::new();
@@ -576,6 +590,696 @@ mod android_smoke {
         })
     }
 
+    pub fn run_control_plane_diagnostic(engine_handle: i64) -> Result<String, String> {
+        let _runtime = ensure_runtime();
+        info!(
+            "Smoke control-plane diagnostic start: engine_handle={}",
+            engine_handle
+        );
+        release_existing_session(engine_handle);
+
+        let diagnostic_api = build_smoke_api(
+            AndroidTextureRegistrationStrategy::HardwareBufferSeam,
+            &[
+                SMOKE_CONTROL_SOURCE_ID,
+                SMOKE_RELEASE_BEFORE_READY_SOURCE_ID,
+                SMOKE_DUPLICATE_SOURCE_ID,
+            ],
+            None,
+            None,
+        );
+
+        with_swapped_runtime(diagnostic_api, || {
+            let register = irondash_ffi_register_engine(engine_handle);
+            if !register.success {
+                return Err(format!(
+                    "control-plane diagnostic register_engine failed with error_code={}",
+                    register.error_code
+                ));
+            }
+
+            let pause_resume_request = irondash_ffi_acquire_shared_texture(
+                SMOKE_CONTROL_SOURCE_ID,
+                engine_handle,
+                FfiPriorityCode::Visible as u32,
+            );
+            if pause_resume_request.decision != FfiAcquireDecision::Accepted as u32 {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "control-plane diagnostic expected initial acquire to be accepted, got decision={} error_code={}",
+                    pause_resume_request.decision, pause_resume_request.error_code
+                ));
+            }
+            let _ = drain_event_records();
+
+            let pause = irondash_ffi_pause_request(pause_resume_request.request_id);
+            if !pause.success || pause.status != 11 {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "control-plane diagnostic expected pause_request to enter Canceling, got success={} status={} error_code={}",
+                    pause.success, pause.status, pause.error_code
+                ));
+            }
+            let pause_events = drain_event_records();
+            if !has_event_type(&pause_events, FfiEventType::RequestPaused as u32) {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "control-plane diagnostic expected RequestPaused event, got {}",
+                    format_event_records(&pause_events)
+                ));
+            }
+
+            let resume = irondash_ffi_resume_request(pause_resume_request.request_id);
+            if !resume.success || resume.status != 2 {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "control-plane diagnostic expected resume to re-enter Loading, got success={} status={} error_code={}",
+                    resume.success, resume.status, resume.error_code
+                ));
+            }
+            let resume_events = drain_event_records();
+            if !has_event_type(&resume_events, FfiEventType::RequestResumed as u32) {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "control-plane diagnostic expected RequestResumed event, got {}",
+                    format_event_records(&resume_events)
+                ));
+            }
+
+            let processed_ready = irondash_ffi_process_pending_requests(1);
+            let ready_events = drain_event_records();
+            let pause_resume_state = request_state(pause_resume_request.request_id)
+                .ok_or_else(|| {
+                    format!(
+                        "control-plane diagnostic could not read resumed request state for request_id={}",
+                        pause_resume_request.request_id
+                    )
+                })?;
+            if processed_ready != 1
+                || pause_resume_state.status != 6
+                || pause_resume_state.texture_id < 0
+                || !has_event_type(&ready_events, FfiEventType::TextureReady as u32)
+            {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "control-plane diagnostic pause/resume path did not reach Ready: processed={}, state_status={}, texture_id={}, events={}",
+                    processed_ready,
+                    pause_resume_state.status,
+                    pause_resume_state.texture_id,
+                    format_event_records(&ready_events)
+                ));
+            }
+
+            let _ = irondash_ffi_release_texture(
+                pause_resume_request.request_id,
+                engine_handle,
+            );
+            let _ = drain_event_records();
+
+            let release_before_ready = irondash_ffi_acquire_shared_texture(
+                SMOKE_RELEASE_BEFORE_READY_SOURCE_ID,
+                engine_handle,
+                FfiPriorityCode::Visible as u32,
+            );
+            if release_before_ready.decision != FfiAcquireDecision::Accepted as u32 {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "control-plane diagnostic expected release-before-ready acquire to be accepted, got decision={} error_code={}",
+                    release_before_ready.decision, release_before_ready.error_code
+                ));
+            }
+            let _ = drain_event_records();
+
+            let release_before_ready_result =
+                irondash_ffi_release_texture(release_before_ready.request_id, engine_handle);
+            let release_before_ready_events = drain_event_records();
+            let late_ready_processed = irondash_ffi_process_pending_requests(1);
+            let late_ready_events = drain_event_records();
+            let release_before_ready_state = request_state(release_before_ready.request_id)
+                .ok_or_else(|| {
+                    format!(
+                        "control-plane diagnostic could not read release-before-ready state for request_id={}",
+                        release_before_ready.request_id
+                    )
+                })?;
+            if release_before_ready_state.status != 9
+                || has_event_type(&late_ready_events, FfiEventType::TextureReady as u32)
+            {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "control-plane diagnostic late-ready discard failed: processed={}, state_status={}, release_events={}, late_events={}",
+                    late_ready_processed,
+                    release_before_ready_state.status,
+                    format_event_records(&release_before_ready_events),
+                    format_event_records(&late_ready_events)
+                ));
+            }
+
+            let duplicate_first = irondash_ffi_acquire_shared_texture(
+                SMOKE_DUPLICATE_SOURCE_ID,
+                engine_handle,
+                FfiPriorityCode::Visible as u32,
+            );
+            if duplicate_first.decision != FfiAcquireDecision::Accepted as u32 {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "control-plane diagnostic expected duplicate first acquire to be accepted, got decision={} error_code={}",
+                    duplicate_first.decision, duplicate_first.error_code
+                ));
+            }
+            let _ = drain_event_records();
+
+            let duplicate_pending = irondash_ffi_acquire_shared_texture(
+                SMOKE_DUPLICATE_SOURCE_ID,
+                engine_handle,
+                FfiPriorityCode::Visible as u32,
+            );
+            if duplicate_pending.decision != FfiAcquireDecision::Reused as u32
+                || duplicate_pending.request_id != duplicate_first.request_id
+            {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "control-plane diagnostic expected duplicate pending acquire to reuse request_id={}, got decision={} request_id={}",
+                    duplicate_first.request_id,
+                    duplicate_pending.decision,
+                    duplicate_pending.request_id
+                ));
+            }
+
+            let duplicate_reuse_events = drain_event_records();
+            let duplicate_processed = irondash_ffi_process_pending_requests(1);
+            let duplicate_ready_events = drain_event_records();
+            let duplicate_ready = irondash_ffi_acquire_shared_texture(
+                SMOKE_DUPLICATE_SOURCE_ID,
+                engine_handle,
+                FfiPriorityCode::Visible as u32,
+            );
+            let duplicate_state = request_state(duplicate_first.request_id).ok_or_else(|| {
+                format!(
+                    "control-plane diagnostic could not read duplicate request state for request_id={}",
+                    duplicate_first.request_id
+                )
+            })?;
+            if duplicate_processed != 1
+                || duplicate_ready.decision != FfiAcquireDecision::Reused as u32
+                || duplicate_ready.request_id != duplicate_first.request_id
+                || duplicate_ready.status != 6
+                || duplicate_state.status != 6
+            {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "control-plane diagnostic duplicate acquire path failed: processed={}, ready_decision={}, ready_status={}, state_status={}, events={}",
+                    duplicate_processed,
+                    duplicate_ready.decision,
+                    duplicate_ready.status,
+                    duplicate_state.status,
+                    format_event_records(&duplicate_ready_events)
+                ));
+            }
+
+            let _ = irondash_ffi_release_texture(duplicate_first.request_id, engine_handle);
+            let _ = drain_event_records();
+
+            let unregister = irondash_ffi_unregister_engine(engine_handle);
+            if !unregister.success {
+                return Err(format!(
+                    "control-plane diagnostic unregister_engine failed with error_code={}",
+                    unregister.error_code
+                ));
+            }
+            let _ = drain_event_records();
+
+            Ok(format!(
+                "p1_control_plane=PASS\npause_resume_path=pause_request -> resume_request -> Ready\npause_events={}\nresume_events={}\nready_events={}\nrelease_before_ready=PASS | result={} | status={} ({}) | followup_ready_events={}\nduplicate_acquire=PASS | pending_reuse_events={} | ready_events={}\nbackpressure_ui=Use existing Trigger Reject Diagnostic button for the max_pending_requests=1 rejection path",
+                format_event_records(&pause_events),
+                format_event_records(&resume_events),
+                format_event_records(&ready_events),
+                release_disposition_name(release_before_ready_result.release_disposition),
+                release_before_ready_state.status,
+                status_name(release_before_ready_state.status),
+                format_event_records(&late_ready_events),
+                format_event_records(&duplicate_reuse_events),
+                format_event_records(&duplicate_ready_events),
+            ))
+        })
+    }
+
+    pub fn run_full_lifecycle_diagnostic() -> Result<String, String> {
+        let budget_bytes = SMOKE_SOURCE_BYTES * 2;
+        let manager = ResourceManager::new(ResourceManagerConfig {
+            max_bytes: budget_bytes,
+            max_sources: 2,
+            high_water_mark: 1.0,
+        });
+        let mut generations = HashMap::<u64, u32>::new();
+        let mut plans = HashMap::<u64, ThreadTarget>::new();
+        let mut cache_bytes_after_insert = Vec::new();
+
+        for source_id_raw in SMOKE_LIFECYCLE_SOURCE_IDS {
+            let source_id = SourceId::new(source_id_raw);
+            let generation = next_lifecycle_generation(&mut generations, source_id_raw);
+            let source = create_smoke_source(source_id, generation).map_err(|error| {
+                format!(
+                    "full lifecycle diagnostic could not create source {} generation {}: {:?}",
+                    source_id_raw, generation, error
+                )
+            })?;
+            let release_plan = source.release_plan();
+            let Some(target_thread) = release_plan.target_thread else {
+                return Err(format!(
+                    "full lifecycle diagnostic source {} is missing a platform cleaner",
+                    source_id_raw
+                ));
+            };
+            plans.insert(source_id_raw, target_thread);
+            manager
+                .register_source(source_id, source)
+                .map_err(|error| {
+                    format!(
+                        "full lifecycle diagnostic could not register source {}: {:?}",
+                        source_id_raw, error
+                    )
+                })?;
+            cache_bytes_after_insert.push(format!("{}:{}", source_id_raw, manager.cache_bytes()));
+        }
+
+        let evicted_source_id = SMOKE_LIFECYCLE_SOURCE_IDS[0];
+        let evicted_state = manager.query_source_lifecycle_state(SourceId::new(evicted_source_id));
+        let evicted_acquire_available = manager.acquire(SourceId::new(evicted_source_id)).is_some();
+        if evicted_acquire_available {
+            manager.release(SourceId::new(evicted_source_id));
+        }
+
+        let mut surviving_sources = Vec::new();
+        for source_id_raw in SMOKE_LIFECYCLE_SOURCE_IDS.iter().skip(1).copied() {
+            let source_id = SourceId::new(source_id_raw);
+            let available = manager.acquire(source_id).is_some();
+            if available {
+                manager.release(source_id);
+            }
+            surviving_sources.push(format!("{}:{}", source_id_raw, available));
+        }
+
+        let reloaded_generation = next_lifecycle_generation(&mut generations, evicted_source_id);
+        let reloaded_source = create_smoke_source(SourceId::new(evicted_source_id), reloaded_generation)
+            .map_err(|error| {
+                format!(
+                    "full lifecycle diagnostic could not recreate evicted source {} generation {}: {:?}",
+                    evicted_source_id, reloaded_generation, error
+                )
+            })?;
+        if let Some(target_thread) = reloaded_source.release_plan().target_thread {
+            plans.insert(evicted_source_id, target_thread);
+        }
+        manager
+            .register_source(SourceId::new(evicted_source_id), reloaded_source)
+            .map_err(|error| {
+                format!(
+                    "full lifecycle diagnostic could not re-register evicted source {}: {:?}",
+                    evicted_source_id, error
+                )
+            })?;
+        let reloaded_acquire_available = manager.acquire(SourceId::new(evicted_source_id)).is_some();
+        if reloaded_acquire_available {
+            manager.release(SourceId::new(evicted_source_id));
+        }
+
+        let cache_after_reload = manager.cache_bytes();
+        let deferred_drop_target = thread_target_name(
+            plans.get(&evicted_source_id)
+                .copied()
+                .unwrap_or(ThreadTarget::Platform),
+        );
+        let final_release = SMOKE_LIFECYCLE_SOURCE_IDS
+            .iter()
+            .copied()
+            .map(|source_id_raw| {
+                format!(
+                    "{}:{}",
+                    source_id_raw,
+                    format_source_release_status(manager.release_source(SourceId::new(source_id_raw)))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        Ok(format!(
+            "p1_full_lifecycle=PASS\nbyte_budget={}\ncache_bytes_after_insert={}\nevicted_source_id={}\nevicted_state={}\nevicted_acquire_available={}\nsurviving_sources={}\nreloaded_source_id={}\nreloaded_generation={}\nreloaded_acquire_available={}\ncache_bytes_after_reload={}\ndeferred_drop_target={}\nfinal_release={}\nnotes=This host diagnostic proves LRU eviction and reload at the resource-manager/shared-source boundary; pair it with the live preview path for visible render checks.",
+            budget_bytes,
+            cache_bytes_after_insert.join(" | "),
+            evicted_source_id,
+            format_source_lifecycle_state(evicted_state),
+            evicted_acquire_available,
+            surviving_sources.join(" | "),
+            evicted_source_id,
+            reloaded_generation,
+            reloaded_acquire_available,
+            cache_after_reload,
+            deferred_drop_target,
+            final_release,
+        ))
+    }
+
+    pub fn run_cancel_midflight_diagnostic(engine_handle: i64) -> Result<String, String> {
+        let _runtime = ensure_runtime();
+        release_existing_session(engine_handle);
+
+        let diagnostic_api = build_smoke_api(
+            AndroidTextureRegistrationStrategy::HardwareBufferSeam,
+            &[SMOKE_CANCEL_MIDFLIGHT_SOURCE_ID],
+            None,
+            None,
+        );
+
+        with_swapped_runtime(diagnostic_api, || {
+            let register = irondash_ffi_register_engine(engine_handle);
+            if !register.success {
+                return Err(format!(
+                    "cancel-midflight diagnostic register_engine failed with error_code={}",
+                    register.error_code
+                ));
+            }
+
+            let acquire = irondash_ffi_acquire_shared_texture(
+                SMOKE_CANCEL_MIDFLIGHT_SOURCE_ID,
+                engine_handle,
+                FfiPriorityCode::Visible as u32,
+            );
+            if acquire.decision != FfiAcquireDecision::Accepted as u32 {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "cancel-midflight diagnostic expected acquire accepted, got decision={} error_code={}",
+                    acquire.decision, acquire.error_code
+                ));
+            }
+
+            let initial_events = drain_event_records();
+            let cancel = irondash_ffi_cancel_request(acquire.request_id);
+            let cancel_events = drain_event_records();
+            let processed = irondash_ffi_process_pending_requests(1);
+            let followup_events = drain_event_records();
+            let final_state = request_state(acquire.request_id).ok_or_else(|| {
+                format!(
+                    "cancel-midflight diagnostic could not read final state for request_id={}",
+                    acquire.request_id
+                )
+            })?;
+
+            if !cancel.success
+                || cancel.status != 11
+                || processed != 0
+                || final_state.status != 11
+                || final_state.texture_id != -1
+                || !has_event_type(&cancel_events, FfiEventType::RequestCanceled as u32)
+                || has_event_type(&followup_events, FfiEventType::TextureReady as u32)
+            {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "cancel-midflight diagnostic failed: command_status={}, processed={}, final_status={}, texture_id={}, initial_events={}, cancel_events={}, followup_events={}",
+                    cancel.status,
+                    processed,
+                    final_state.status,
+                    final_state.texture_id,
+                    format_event_records(&initial_events),
+                    format_event_records(&cancel_events),
+                    format_event_records(&followup_events),
+                ));
+            }
+
+            let _ = irondash_ffi_unregister_engine(engine_handle);
+            let _ = drain_event_records();
+
+            Ok(format!(
+                "cancel_midflight=PASS\ninitial_events={}\ncommand_status={} ({})\nfinal_status={} ({})\ntexture_id={}\ncancel_events={}\nfollowup_events={}",
+                format_event_records(&initial_events),
+                cancel.status,
+                status_name(cancel.status),
+                final_state.status,
+                status_name(final_state.status),
+                final_state.texture_id,
+                format_event_records(&cancel_events),
+                format_event_records(&followup_events),
+            ))
+        })
+    }
+
+    pub fn run_cancel_after_ready_diagnostic(engine_handle: i64) -> Result<String, String> {
+        let _runtime = ensure_runtime();
+        release_existing_session(engine_handle);
+
+        let diagnostic_api = build_smoke_api(
+            AndroidTextureRegistrationStrategy::HardwareBufferSeam,
+            &[SMOKE_CANCEL_AFTER_READY_SOURCE_ID],
+            None,
+            None,
+        );
+
+        with_swapped_runtime(diagnostic_api, || {
+            let register = irondash_ffi_register_engine(engine_handle);
+            if !register.success {
+                return Err(format!(
+                    "cancel-after-ready diagnostic register_engine failed with error_code={}",
+                    register.error_code
+                ));
+            }
+
+            let acquire = irondash_ffi_acquire_shared_texture(
+                SMOKE_CANCEL_AFTER_READY_SOURCE_ID,
+                engine_handle,
+                FfiPriorityCode::Visible as u32,
+            );
+            if acquire.decision != FfiAcquireDecision::Accepted as u32 {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "cancel-after-ready diagnostic expected acquire accepted, got decision={} error_code={}",
+                    acquire.decision, acquire.error_code
+                ));
+            }
+
+            let _ = drain_event_records();
+            let processed = irondash_ffi_process_pending_requests(1);
+            let ready_events = drain_event_records();
+            let ready_state = request_state(acquire.request_id).ok_or_else(|| {
+                format!(
+                    "cancel-after-ready diagnostic could not read ready state for request_id={}",
+                    acquire.request_id
+                )
+            })?;
+            if processed != 1 || ready_state.status != 6 || ready_state.texture_id < 0 {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "cancel-after-ready diagnostic expected Ready before cancel, got processed={} status={} texture_id={} events={}",
+                    processed,
+                    ready_state.status,
+                    ready_state.texture_id,
+                    format_event_records(&ready_events)
+                ));
+            }
+
+            let cancel = irondash_ffi_cancel_request(acquire.request_id);
+            let cancel_events = drain_event_records();
+            let state_after_cancel = request_state(acquire.request_id).ok_or_else(|| {
+                format!(
+                    "cancel-after-ready diagnostic could not read post-cancel state for request_id={}",
+                    acquire.request_id
+                )
+            })?;
+            if !cancel.success
+                || cancel.status != 6
+                || !cancel_events.is_empty()
+                || state_after_cancel.status != 6
+                || state_after_cancel.texture_id != ready_state.texture_id
+            {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "cancel-after-ready diagnostic expected silent no-op, got command_status={}, state_status={}, cancel_events={}, texture_before={}, texture_after={}",
+                    cancel.status,
+                    state_after_cancel.status,
+                    format_event_records(&cancel_events),
+                    ready_state.texture_id,
+                    state_after_cancel.texture_id,
+                ));
+            }
+
+            let _ = irondash_ffi_release_texture(acquire.request_id, engine_handle);
+            let _ = drain_event_records();
+            let _ = irondash_ffi_unregister_engine(engine_handle);
+            let _ = drain_event_records();
+
+            Ok(format!(
+                "cancel_after_ready=PASS\ncommand_status={} ({})\nstate_status={} ({})\ntexture_id={}\ncancel_events={}",
+                cancel.status,
+                status_name(cancel.status),
+                state_after_cancel.status,
+                status_name(state_after_cancel.status),
+                state_after_cancel.texture_id,
+                format_event_records(&cancel_events),
+            ))
+        })
+    }
+
+    pub fn run_interleaved_pause_resume_diagnostic(engine_handle: i64) -> Result<String, String> {
+        let _runtime = ensure_runtime();
+        release_existing_session(engine_handle);
+
+        let diagnostic_api = build_smoke_api(
+            AndroidTextureRegistrationStrategy::HardwareBufferSeam,
+            &[SMOKE_INTERLEAVED_CONTROL_SOURCE_ID],
+            None,
+            None,
+        );
+
+        with_swapped_runtime(diagnostic_api, || {
+            let register = irondash_ffi_register_engine(engine_handle);
+            if !register.success {
+                return Err(format!(
+                    "interleaved pause/resume diagnostic register_engine failed with error_code={}",
+                    register.error_code
+                ));
+            }
+
+            let acquire = irondash_ffi_acquire_shared_texture(
+                SMOKE_INTERLEAVED_CONTROL_SOURCE_ID,
+                engine_handle,
+                FfiPriorityCode::Visible as u32,
+            );
+            if acquire.decision != FfiAcquireDecision::Accepted as u32 {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "interleaved pause/resume diagnostic expected acquire accepted, got decision={} error_code={}",
+                    acquire.decision, acquire.error_code
+                ));
+            }
+
+            let _ = drain_event_records();
+            let pause = irondash_ffi_pause_request(acquire.request_id);
+            let resume = irondash_ffi_resume_request(acquire.request_id);
+            let control_events = drain_event_records();
+            let processed = irondash_ffi_process_pending_requests(1);
+            let ready_events = drain_event_records();
+            let final_state = request_state(acquire.request_id).ok_or_else(|| {
+                format!(
+                    "interleaved pause/resume diagnostic could not read final state for request_id={}",
+                    acquire.request_id
+                )
+            })?;
+
+            if !pause.success
+                || !resume.success
+                || processed != 1
+                || final_state.status != 6
+                || final_state.texture_id < 0
+                || !has_event_type(&control_events, FfiEventType::RequestPaused as u32)
+                || !has_event_type(&control_events, FfiEventType::RequestResumed as u32)
+                || !has_event_type(&ready_events, FfiEventType::TextureReady as u32)
+            {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "interleaved pause/resume diagnostic failed: pause_status={}, resume_status={}, processed={}, final_status={}, control_events={}, ready_events={}",
+                    pause.status,
+                    resume.status,
+                    processed,
+                    final_state.status,
+                    format_event_records(&control_events),
+                    format_event_records(&ready_events),
+                ));
+            }
+
+            let _ = irondash_ffi_release_texture(acquire.request_id, engine_handle);
+            let _ = drain_event_records();
+            let _ = irondash_ffi_unregister_engine(engine_handle);
+            let _ = drain_event_records();
+
+            Ok(format!(
+                "interleaved_pause_resume=PASS\npause_status={} ({})\nresume_status={} ({})\ncontrol_events={}\nready_events={}\nfinal_status={} ({}) | texture_id={}",
+                pause.status,
+                status_name(pause.status),
+                resume.status,
+                status_name(resume.status),
+                format_event_records(&control_events),
+                format_event_records(&ready_events),
+                final_state.status,
+                status_name(final_state.status),
+                final_state.texture_id,
+            ))
+        })
+    }
+
+    pub fn run_engine_gone_pending_diagnostic(engine_handle: i64) -> Result<String, String> {
+        let _runtime = ensure_runtime();
+        release_existing_session(engine_handle);
+
+        let diagnostic_api = build_smoke_api(
+            AndroidTextureRegistrationStrategy::HardwareBufferSeam,
+            &[SMOKE_ENGINE_GONE_PENDING_SOURCE_ID],
+            None,
+            None,
+        );
+
+        with_swapped_runtime(diagnostic_api, || {
+            let register = irondash_ffi_register_engine(engine_handle);
+            if !register.success {
+                return Err(format!(
+                    "engine-gone-pending diagnostic register_engine failed with error_code={}",
+                    register.error_code
+                ));
+            }
+
+            let acquire = irondash_ffi_acquire_shared_texture(
+                SMOKE_ENGINE_GONE_PENDING_SOURCE_ID,
+                engine_handle,
+                FfiPriorityCode::Visible as u32,
+            );
+            if acquire.decision != FfiAcquireDecision::Accepted as u32 {
+                let _ = irondash_ffi_unregister_engine(engine_handle);
+                return Err(format!(
+                    "engine-gone-pending diagnostic expected acquire accepted, got decision={} error_code={}",
+                    acquire.decision, acquire.error_code
+                ));
+            }
+
+            let initial_events = drain_event_records();
+            let unregister = irondash_ffi_unregister_engine(engine_handle);
+            let engine_gone_events = drain_event_records();
+            let processed = irondash_ffi_process_pending_requests(1);
+            let followup_events = drain_event_records();
+            let state_after_unregister = request_state(acquire.request_id);
+
+            if !unregister.success
+                || processed != 0
+                || state_after_unregister.is_some()
+                || !has_event_type(&engine_gone_events, FfiEventType::EngineGone as u32)
+                || has_event_type(&followup_events, FfiEventType::TextureReady as u32)
+            {
+                return Err(format!(
+                    "engine-gone-pending diagnostic failed: processed={}, state_present={}, initial_events={}, engine_gone_events={}, followup_events={}",
+                    processed,
+                    state_after_unregister.is_some(),
+                    format_event_records(&initial_events),
+                    format_event_records(&engine_gone_events),
+                    format_event_records(&followup_events),
+                ));
+            }
+
+            Ok(format!(
+                "engine_gone_pending=PASS\ninitial_events={}\nengine_gone_events={}\nfollowup_events={}\nrequest_state_after_unregister={}",
+                format_event_records(&initial_events),
+                format_event_records(&engine_gone_events),
+                format_event_records(&followup_events),
+                if state_after_unregister.is_some() { "present" } else { "absent" },
+            ))
+        })
+    }
+
+    fn next_lifecycle_generation(
+        generations: &mut HashMap<u64, u32>,
+        source_id: u64,
+    ) -> u32 {
+        let generation = generations.entry(source_id).or_insert(0);
+        *generation += 1;
+        *generation
+    }
+
     fn ensure_runtime() -> Arc<FfiApi> {
         SMOKE_RUNTIME
             .get_or_init(|| {
@@ -797,8 +1501,8 @@ mod android_smoke {
         );
     }
 
-    fn drain_events(request_id: u64) -> Option<i64> {
-        let mut ready_texture_id = None;
+    fn drain_event_records() -> Vec<FfiEventRecord> {
+        let mut events = Vec::new();
 
         loop {
             let mut event = FfiEventRecord::default();
@@ -811,6 +1515,16 @@ mod android_smoke {
                 event.event_type, event.request_id, event.texture_id, event.status, event.error_code
             );
 
+            events.push(event);
+        }
+
+        events
+    }
+
+    fn drain_events(request_id: u64) -> Option<i64> {
+        let mut ready_texture_id = None;
+
+        for event in drain_event_records() {
             if event.request_id == request_id
                 && event.event_type == FfiEventType::TextureReady as u32
                 && event.texture_id >= 0
@@ -931,6 +1645,105 @@ mod android_smoke {
         }
     }
 
+    fn cancel_reason_name(cancel_reason: u32) -> &'static str {
+        match cancel_reason {
+            1 => "UserRequest",
+            2 => "EngineDestroyed",
+            3 => "SourceEvicted",
+            4 => "Timeout",
+            5 => "Backpressure",
+            6 => "Other",
+            _ => "None",
+        }
+    }
+
+    fn release_disposition_name(release_disposition: u32) -> &'static str {
+        match release_disposition {
+            value if value == FfiReleaseDisposition::Released as u32 => "Released",
+            value if value == FfiReleaseDisposition::Deferred as u32 => "Deferred",
+            value if value == FfiReleaseDisposition::NotFound as u32 => "NotFound",
+            _ => "None",
+        }
+    }
+
+    fn thread_target_name(target: ThreadTarget) -> &'static str {
+        match target {
+            ThreadTarget::Platform => "Platform",
+            ThreadTarget::Raster => "Raster",
+            ThreadTarget::Worker => "Worker",
+        }
+    }
+
+    fn has_event_type(events: &[FfiEventRecord], event_type: u32) -> bool {
+        events.iter().any(|event| event.event_type == event_type)
+    }
+
+    fn format_event_records(events: &[FfiEventRecord]) -> String {
+        if events.is_empty() {
+            return "-".to_string();
+        }
+
+        events
+            .iter()
+            .map(format_event_record)
+            .collect::<Vec<_>>()
+            .join(" -> ")
+    }
+
+    fn format_event_record(event: &FfiEventRecord) -> String {
+        match event.event_type {
+            value if value == FfiEventType::TextureReady as u32 => {
+                format!("TextureReady:{}", display_i64(event.texture_id))
+            }
+            value if value == FfiEventType::StatusChanged as u32 => {
+                format!("StatusChanged:{}", status_name(event.status))
+            }
+            value if value == FfiEventType::RequestResumed as u32 => {
+                format!("RequestResumed:{}", status_name(event.status))
+            }
+            value if value == FfiEventType::RequestPaused as u32 => {
+                format!("RequestPaused:{}", status_name(event.status))
+            }
+            value if value == FfiEventType::RequestCanceled as u32 => format!(
+                "RequestCanceled:{}:{}",
+                cancel_reason_name(event.cancel_reason),
+                status_name(event.status)
+            ),
+            value if value == FfiEventType::ResourceReleased as u32 => format!(
+                "ResourceReleased:{}:{}",
+                release_disposition_name(event.release_disposition),
+                status_name(event.status)
+            ),
+            value if value == FfiEventType::EngineGone as u32 => {
+                format!("EngineGone:{}", event.engine_handle)
+            }
+            _ => format!("Event{}", event.event_type),
+        }
+    }
+
+    fn format_source_lifecycle_state(state: Option<SourceLifecycleState>) -> String {
+        match state {
+            Some(state) => format!("{:?}", state),
+            None => "-".to_string(),
+        }
+    }
+
+    fn format_source_release_status(status: SourceReleaseStatus) -> String {
+        match status {
+            SourceReleaseStatus::Released {
+                lifecycle_state,
+                outcome,
+            } => format!("Released:{:?}/{:?}", lifecycle_state, outcome),
+            SourceReleaseStatus::Deferred {
+                lifecycle_state,
+                active_borrows,
+            } => format!("Deferred:{:?}/{}", lifecycle_state, active_borrows),
+            SourceReleaseStatus::NotFound { last_known_state } => {
+                format!("NotFound:{}", format_source_lifecycle_state(last_known_state))
+            }
+        }
+    }
+
     fn display_u64(value: u64) -> String {
         value.to_string()
     }
@@ -982,12 +1795,12 @@ mod android_smoke {
             source_id.as_u64(),
             generation,
             ahb_ptr,
-            (SMOKE_WIDTH as usize) * (SMOKE_HEIGHT as usize) * SMOKE_BYTES_PER_PIXEL
+            SMOKE_SOURCE_BYTES
         );
         SharedSource::new_with_deferred_drop(
             source_id,
             handle.into(),
-            (SMOKE_WIDTH as usize) * (SMOKE_HEIGHT as usize) * SMOKE_BYTES_PER_PIXEL,
+            SMOKE_SOURCE_BYTES,
             cleaner,
         )
         .map(Arc::new)
@@ -1333,6 +2146,205 @@ pub extern "C" fn run_bridge_failure_diagnostic_example(
         {
             let _ = engine_id;
             port.send("bridge diagnostic is Android-only".to_string());
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn run_control_plane_diagnostic_example(
+    engine_id: i64,
+    ffi_ptr: *mut c_void,
+    port: i64,
+) {
+    init_logging();
+    irondash_dart_ffi::irondash_init_ffi(ffi_ptr);
+
+    RunLoop::sender_for_main_thread().unwrap().send(move || {
+        let port = irondash_dart_ffi::DartPort::new(port);
+
+        #[cfg(target_os = "android")]
+        {
+            match android_smoke::run_control_plane_diagnostic(engine_id) {
+                Ok(message) => {
+                    let _ = port.send(message);
+                }
+                Err(err) => {
+                    error!("Android smoke control-plane diagnostic failed: {}", err);
+                    let _ = port.send(format!("control-plane diagnostic failed: {}", err));
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = engine_id;
+            let _ = port.send("control-plane diagnostic is Android-only".to_string());
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn run_full_lifecycle_diagnostic_example(
+    engine_id: i64,
+    ffi_ptr: *mut c_void,
+    port: i64,
+) {
+    init_logging();
+    irondash_dart_ffi::irondash_init_ffi(ffi_ptr);
+
+    RunLoop::sender_for_main_thread().unwrap().send(move || {
+        let port = irondash_dart_ffi::DartPort::new(port);
+
+        #[cfg(target_os = "android")]
+        {
+            let _ = engine_id;
+            match android_smoke::run_full_lifecycle_diagnostic() {
+                Ok(message) => {
+                    let _ = port.send(message);
+                }
+                Err(err) => {
+                    error!("Android smoke full lifecycle diagnostic failed: {}", err);
+                    let _ = port.send(format!("full lifecycle diagnostic failed: {}", err));
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = engine_id;
+            let _ = port.send("full lifecycle diagnostic is Android-only".to_string());
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn run_cancel_midflight_diagnostic_example(
+    engine_id: i64,
+    ffi_ptr: *mut c_void,
+    port: i64,
+) {
+    init_logging();
+    irondash_dart_ffi::irondash_init_ffi(ffi_ptr);
+
+    RunLoop::sender_for_main_thread().unwrap().send(move || {
+        let port = irondash_dart_ffi::DartPort::new(port);
+
+        #[cfg(target_os = "android")]
+        {
+            match android_smoke::run_cancel_midflight_diagnostic(engine_id) {
+                Ok(message) => {
+                    let _ = port.send(message);
+                }
+                Err(err) => {
+                    error!("Android smoke cancel-midflight diagnostic failed: {}", err);
+                    let _ = port.send(format!("cancel-midflight diagnostic failed: {}", err));
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = engine_id;
+            let _ = port.send("cancel-midflight diagnostic is Android-only".to_string());
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn run_cancel_after_ready_diagnostic_example(
+    engine_id: i64,
+    ffi_ptr: *mut c_void,
+    port: i64,
+) {
+    init_logging();
+    irondash_dart_ffi::irondash_init_ffi(ffi_ptr);
+
+    RunLoop::sender_for_main_thread().unwrap().send(move || {
+        let port = irondash_dart_ffi::DartPort::new(port);
+
+        #[cfg(target_os = "android")]
+        {
+            match android_smoke::run_cancel_after_ready_diagnostic(engine_id) {
+                Ok(message) => {
+                    let _ = port.send(message);
+                }
+                Err(err) => {
+                    error!("Android smoke cancel-after-ready diagnostic failed: {}", err);
+                    let _ = port.send(format!("cancel-after-ready diagnostic failed: {}", err));
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = engine_id;
+            let _ = port.send("cancel-after-ready diagnostic is Android-only".to_string());
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn run_interleaved_pause_resume_diagnostic_example(
+    engine_id: i64,
+    ffi_ptr: *mut c_void,
+    port: i64,
+) {
+    init_logging();
+    irondash_dart_ffi::irondash_init_ffi(ffi_ptr);
+
+    RunLoop::sender_for_main_thread().unwrap().send(move || {
+        let port = irondash_dart_ffi::DartPort::new(port);
+
+        #[cfg(target_os = "android")]
+        {
+            match android_smoke::run_interleaved_pause_resume_diagnostic(engine_id) {
+                Ok(message) => {
+                    let _ = port.send(message);
+                }
+                Err(err) => {
+                    error!("Android smoke interleaved pause/resume diagnostic failed: {}", err);
+                    let _ = port.send(format!("interleaved pause/resume diagnostic failed: {}", err));
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = engine_id;
+            let _ = port.send("interleaved pause/resume diagnostic is Android-only".to_string());
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn run_engine_gone_pending_diagnostic_example(
+    engine_id: i64,
+    ffi_ptr: *mut c_void,
+    port: i64,
+) {
+    init_logging();
+    irondash_dart_ffi::irondash_init_ffi(ffi_ptr);
+
+    RunLoop::sender_for_main_thread().unwrap().send(move || {
+        let port = irondash_dart_ffi::DartPort::new(port);
+
+        #[cfg(target_os = "android")]
+        {
+            match android_smoke::run_engine_gone_pending_diagnostic(engine_id) {
+                Ok(message) => {
+                    let _ = port.send(message);
+                }
+                Err(err) => {
+                    error!("Android smoke engine-gone-pending diagnostic failed: {}", err);
+                    let _ = port.send(format!("engine-gone-pending diagnostic failed: {}", err));
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = engine_id;
+            let _ = port.send("engine-gone-pending diagnostic is Android-only".to_string());
         }
     });
 }

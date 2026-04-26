@@ -83,6 +83,108 @@ Future<String> runBridgeFailureDiagnostic(int engineHandle) async {
   return await port.first as String;
 }
 
+Future<String> runControlPlaneDiagnostic(int engineHandle) async {
+  final dylib = _loadLibrary();
+  final function = dylib
+      .lookup<NativeFunction<Void Function(Int64, Pointer<Void>, Int64)>>(
+        'run_control_plane_diagnostic_example',
+      )
+      .asFunction<void Function(int, Pointer<Void>, int)>();
+
+  final port = ReceivePort();
+  function(
+    engineHandle,
+    NativeApi.initializeApiDLData,
+    port.sendPort.nativePort,
+  );
+  return await port.first as String;
+}
+
+Future<String> runFullLifecycleDiagnostic(int engineHandle) async {
+  final dylib = _loadLibrary();
+  final function = dylib
+      .lookup<NativeFunction<Void Function(Int64, Pointer<Void>, Int64)>>(
+        'run_full_lifecycle_diagnostic_example',
+      )
+      .asFunction<void Function(int, Pointer<Void>, int)>();
+
+  final port = ReceivePort();
+  function(
+    engineHandle,
+    NativeApi.initializeApiDLData,
+    port.sendPort.nativePort,
+  );
+  return await port.first as String;
+}
+
+Future<String> runCancelMidflightDiagnostic(int engineHandle) async {
+  final dylib = _loadLibrary();
+  final function = dylib
+      .lookup<NativeFunction<Void Function(Int64, Pointer<Void>, Int64)>>(
+        'run_cancel_midflight_diagnostic_example',
+      )
+      .asFunction<void Function(int, Pointer<Void>, int)>();
+
+  final port = ReceivePort();
+  function(
+    engineHandle,
+    NativeApi.initializeApiDLData,
+    port.sendPort.nativePort,
+  );
+  return await port.first as String;
+}
+
+Future<String> runCancelAfterReadyDiagnostic(int engineHandle) async {
+  final dylib = _loadLibrary();
+  final function = dylib
+      .lookup<NativeFunction<Void Function(Int64, Pointer<Void>, Int64)>>(
+        'run_cancel_after_ready_diagnostic_example',
+      )
+      .asFunction<void Function(int, Pointer<Void>, int)>();
+
+  final port = ReceivePort();
+  function(
+    engineHandle,
+    NativeApi.initializeApiDLData,
+    port.sendPort.nativePort,
+  );
+  return await port.first as String;
+}
+
+Future<String> runInterleavedPauseResumeDiagnostic(int engineHandle) async {
+  final dylib = _loadLibrary();
+  final function = dylib
+      .lookup<NativeFunction<Void Function(Int64, Pointer<Void>, Int64)>>(
+        'run_interleaved_pause_resume_diagnostic_example',
+      )
+      .asFunction<void Function(int, Pointer<Void>, int)>();
+
+  final port = ReceivePort();
+  function(
+    engineHandle,
+    NativeApi.initializeApiDLData,
+    port.sendPort.nativePort,
+  );
+  return await port.first as String;
+}
+
+Future<String> runEngineGonePendingDiagnostic(int engineHandle) async {
+  final dylib = _loadLibrary();
+  final function = dylib
+      .lookup<NativeFunction<Void Function(Int64, Pointer<Void>, Int64)>>(
+        'run_engine_gone_pending_diagnostic_example',
+      )
+      .asFunction<void Function(int, Pointer<Void>, int)>();
+
+  final port = ReceivePort();
+  function(
+    engineHandle,
+    NativeApi.initializeApiDLData,
+    port.sendPort.nativePort,
+  );
+  return await port.first as String;
+}
+
 Future<String> fetchSmokeSnapshot(int engineHandle) async {
   final dylib = _loadLibrary();
   final function = dylib
@@ -193,6 +295,59 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
   bool _busy = false;
   String _status = '等待初始化';
   String _snapshot = '尚无 smoke snapshot';
+  String _p1Report = '尚无 P1 诊断结果';
+
+  void _appendP1ReportSection(String title, String result) {
+    final section = '[$title]\n$result';
+    _p1Report = _p1Report == '尚无 P1 诊断结果'
+        ? section
+        : '[$title]\n$result\n\n$_p1Report';
+  }
+
+  Future<void> _runP1Diagnostic({
+    required String statusLabel,
+    required String reportTitle,
+    required Future<String> Function(int engineHandle) invoke,
+    String? snapshotMessage,
+  }) async {
+    int? engineHandle;
+
+    setState(() {
+      _busy = true;
+      _status = statusLabel;
+    });
+
+    try {
+      engineHandle = _engineHandle ?? await EngineContext.instance.getEngineHandle();
+      final result = await invoke(engineHandle);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _engineHandle = engineHandle;
+        _textureId = null;
+        _status = '$reportTitle 已完成；详见下方报告';
+        if (snapshotMessage != null) {
+          _snapshot = snapshotMessage;
+        }
+        _appendP1ReportSection(reportTitle, result);
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _status = '$reportTitle 失败: $error';
+        _appendP1ReportSection(reportTitle, '$reportTitle 失败: $error');
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+        });
+      }
+    }
+  }
 
   @override
   void didChangeDependencies() {
@@ -370,6 +525,60 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
     }
   }
 
+  Future<void> _runControlPlaneDiagnostic() async {
+    await _runP1Diagnostic(
+      statusLabel: '正在运行 P1 控制面诊断（pause/resume、release-before-ready、duplicate acquire）',
+      reportTitle: 'P1 Control Plane Matrix',
+      invoke: runControlPlaneDiagnostic,
+      snapshotMessage: 'P1 控制面诊断使用独立 runtime；需要时重新 Acquire 或 Refresh Snapshot 回到 baseline。',
+    );
+  }
+
+  Future<void> _runFullLifecycleDiagnostic() async {
+    await _runP1Diagnostic(
+      statusLabel: '正在运行 P1 完整生命周期诊断（LRU eviction、reload、DeferredDrop 路由）',
+      reportTitle: 'P1 Full Lifecycle',
+      invoke: runFullLifecycleDiagnostic,
+      snapshotMessage: 'P1 完整生命周期诊断运行在 resource-manager/shared-source 边界；需要时重新 Acquire 回到 live preview。',
+    );
+  }
+
+  Future<void> _runCancelMidflightDiagnostic() async {
+    await _runP1Diagnostic(
+      statusLabel: '正在运行 P1 控制面诊断（cancel mid-flight）',
+      reportTitle: 'P1 Cancel Mid-Flight',
+      invoke: runCancelMidflightDiagnostic,
+      snapshotMessage: 'cancel mid-flight 诊断使用独立 runtime；需要时重新 Acquire 恢复 live preview。',
+    );
+  }
+
+  Future<void> _runCancelAfterReadyDiagnostic() async {
+    await _runP1Diagnostic(
+      statusLabel: '正在运行 P1 控制面诊断（cancel-after-ready no-op）',
+      reportTitle: 'P1 Cancel After Ready',
+      invoke: runCancelAfterReadyDiagnostic,
+      snapshotMessage: 'cancel-after-ready 诊断使用独立 runtime；需要时重新 Acquire 恢复 live preview。',
+    );
+  }
+
+  Future<void> _runInterleavedPauseResumeDiagnostic() async {
+    await _runP1Diagnostic(
+      statusLabel: '正在运行 P1 控制面诊断（interleaved pause/resume）',
+      reportTitle: 'P1 Interleaved Pause Resume',
+      invoke: runInterleavedPauseResumeDiagnostic,
+      snapshotMessage: 'interleaved pause/resume 诊断使用独立 runtime；需要时重新 Acquire 恢复 live preview。',
+    );
+  }
+
+  Future<void> _runEngineGonePendingDiagnostic() async {
+    await _runP1Diagnostic(
+      statusLabel: '正在运行 P1 控制面诊断（engine-gone with pending callbacks）',
+      reportTitle: 'P1 EngineGone Pending',
+      invoke: runEngineGonePendingDiagnostic,
+      snapshotMessage: 'engine-gone pending 诊断使用独立 runtime；需要时重新 Acquire 恢复 live preview。',
+    );
+  }
+
   Future<void> _refreshSnapshot({int? engineHandleOverride}) async {
     final engineHandle = engineHandleOverride ?? _engineHandle;
     if (engineHandle == null) {
@@ -540,6 +749,36 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
               ),
             ),
           ),
+          if (widget.showHostLauncher) const SizedBox(height: 20),
+          if (widget.showHostLauncher)
+            Card.outlined(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'P1 Diagnostic Report',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Lifecycle 按钮覆盖 LRU eviction + reload + DeferredDrop target；控制面按钮现在分别覆盖 pause/resume、cancel mid-flight、cancel-after-ready、interleaved pause/resume、engine-gone-with-pending。背压拒绝仍通过现有 Reject Diagnostic 按钮验证。',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                    const SizedBox(height: 12),
+                    SelectionArea(
+                      child: Text(
+                        _p1Report,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                              fontFamily: 'monospace',
+                            ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           const SizedBox(height: 20),
           Wrap(
             spacing: 12,
@@ -570,6 +809,36 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
                 onPressed: _busy ? null : _runBridgeFailureDiagnostic,
                 child: const Text('Trigger Bridge Failure'),
               ),
+              if (widget.showHostLauncher)
+                OutlinedButton(
+                  onPressed: _busy ? null : _runControlPlaneDiagnostic,
+                  child: const Text('Run P1 Control Plane'),
+                ),
+              if (widget.showHostLauncher)
+                OutlinedButton(
+                  onPressed: _busy ? null : _runCancelMidflightDiagnostic,
+                  child: const Text('Run Cancel Mid-Flight'),
+                ),
+              if (widget.showHostLauncher)
+                OutlinedButton(
+                  onPressed: _busy ? null : _runCancelAfterReadyDiagnostic,
+                  child: const Text('Run Cancel-After-Ready'),
+                ),
+              if (widget.showHostLauncher)
+                OutlinedButton(
+                  onPressed: _busy ? null : _runInterleavedPauseResumeDiagnostic,
+                  child: const Text('Run Interleaved Pause/Resume'),
+                ),
+              if (widget.showHostLauncher)
+                OutlinedButton(
+                  onPressed: _busy ? null : _runEngineGonePendingDiagnostic,
+                  child: const Text('Run EngineGone Pending'),
+                ),
+              if (widget.showHostLauncher)
+                OutlinedButton(
+                  onPressed: _busy ? null : _runFullLifecycleDiagnostic,
+                  child: const Text('Load Multiple Sources (P1)'),
+                ),
             ],
           ),
           const SizedBox(height: 16),

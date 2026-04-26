@@ -27,6 +27,8 @@ platform-android = { path = "../../../../crates/platform-android" }
 protocol = { path = "../../../../crates/protocol" }
 request-orchestrator = { path = "../../../../crates/request-orchestrator" }
 shared-source = { path = "../../../../crates/shared-source" }
+resource-manager = { path = "../../../../crates/resource-manager" }
+thread-dispatcher = { path = "../../../../crates/thread-dispatcher" }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 oslog = "0.2.0"
