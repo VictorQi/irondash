@@ -51,6 +51,7 @@ mod android_smoke {
         FfiReleaseDisposition,
         FfiRequestStateSnapshot,
         FfiRuntimeMetricsSnapshot,
+        FfiStatusCode,
         SourceProvider,
         TextureRegistryStore,
     };
@@ -80,6 +81,8 @@ mod android_smoke {
     const SMOKE_STRESS_CYCLE_SOURCE_ID: u64 = 1301;
     const SMOKE_FLICKER_SOURCE_ID: u64 = 1302;
     const SMOKE_CONCURRENT_SOURCE_ID: u64 = 1303;
+    const SMOKE_P3_DOWNGRADE_SOURCE_ID: u64 = 1401;
+    const SMOKE_P3_LEGACY_AHB_SOURCE_ID: u64 = 1402;
     const SMOKE_STRESS_CYCLE_COUNT: usize = 100;
     const SMOKE_FLICKER_CYCLE_COUNT: usize = 24;
     const SMOKE_WIDTH: i32 = 256;
@@ -187,6 +190,22 @@ mod android_smoke {
 
     struct SmokeFailingBridgeDriver;
 
+    struct AndroidPixelFallbackSourceProvider {
+        last_cleaner: Mutex<Option<Arc<AndroidPlatformCleaner>>>,
+    }
+
+    struct P3DiagnosticRegistryStore {
+        next_texture_id: AtomicI64,
+        observed_requests: Mutex<Vec<EngineTextureRegistrationRequest>>,
+        mark_frame_available_count: AtomicUsize,
+        native_window_target: usize,
+    }
+
+    struct SmokePixelFallbackBridgeDriver {
+        call_count: AtomicUsize,
+        observed_targets: Mutex<Vec<usize>>,
+    }
+
     impl AndroidSmokeSourceProvider {
         fn new(source_ids: &'static [u64]) -> Self {
             Self {
@@ -222,6 +241,185 @@ mod android_smoke {
             Err(ResourceError::PlatformResourceFailed(
                 "smoke bridge failure".into(),
             ))
+        }
+    }
+
+    impl AndroidPixelFallbackSourceProvider {
+        fn new() -> Self {
+            Self {
+                last_cleaner: Mutex::new(None),
+            }
+        }
+
+        fn last_cleaner_state(&self) -> Option<platform_android::AHBCleanupState> {
+            self.last_cleaner
+                .lock()
+                .expect("pixel fallback cleaner mutex poisoned")
+                .as_ref()
+                .map(|cleaner| cleaner.state())
+        }
+    }
+
+    impl SourceProvider for AndroidPixelFallbackSourceProvider {
+        fn resolve_source(&self, source_id: SourceId) -> Result<Arc<SharedSource>, ResourceError> {
+            let cleaner = Arc::new(AndroidPlatformCleaner::new());
+            cleaner.mark_downgraded();
+            *self
+                .last_cleaner
+                .lock()
+                .expect("pixel fallback cleaner mutex poisoned") = Some(cleaner.clone());
+
+            SharedSource::new_with_deferred_drop(
+                source_id,
+                PlatformHandle::new_raw(
+                    source_id.as_u64() as usize as *mut c_void,
+                    "android_pixel_buffer",
+                ),
+                SMOKE_SOURCE_BYTES,
+                cleaner,
+            )
+            .map(Arc::new)
+        }
+    }
+
+    impl P3DiagnosticRegistryStore {
+        fn new(native_window_target: usize) -> Self {
+            Self {
+                next_texture_id: AtomicI64::new(9000),
+                observed_requests: Mutex::new(Vec::new()),
+                mark_frame_available_count: AtomicUsize::new(0),
+                native_window_target,
+            }
+        }
+
+        fn observed_requests(&self) -> Vec<EngineTextureRegistrationRequest> {
+            self.observed_requests
+                .lock()
+                .expect("p3 registry observed-requests mutex poisoned")
+                .clone()
+        }
+    }
+
+    impl TextureRegistryStore for P3DiagnosticRegistryStore {
+        fn register_texture(
+            &self,
+            engine_handle: EngineHandle,
+            source: Arc<SharedSource>,
+            resource_manager: &ResourceManager,
+        ) -> Result<RegisteredTextureInfo, ResourceError> {
+            self.register_texture_with_request(
+                engine_handle,
+                source,
+                resource_manager,
+                EngineTextureRegistrationRequest::Default,
+            )
+        }
+
+        fn register_texture_with_request(
+            &self,
+            _engine_handle: EngineHandle,
+            _source: Arc<SharedSource>,
+            _resource_manager: &ResourceManager,
+            request: EngineTextureRegistrationRequest,
+        ) -> Result<RegisteredTextureInfo, ResourceError> {
+            self.observed_requests
+                .lock()
+                .expect("p3 registry observed-requests mutex poisoned")
+                .push(request);
+
+            let (registration_descriptor, availability) = match request {
+                EngineTextureRegistrationRequest::Default => (
+                    EngineTextureRegistrationDescriptor::AndroidNativeWindowTexture {
+                        bridge_status: AndroidTextureBridgeStatus::PendingPlatformBridge,
+                    },
+                    InitialTextureAvailability::PendingBridge,
+                ),
+                EngineTextureRegistrationRequest::AndroidHardwareBufferSeam => (
+                    EngineTextureRegistrationDescriptor::AndroidHardwareBufferTexture {
+                        source_kind: AndroidHardwareBufferSourceKind::AHardwareBuffer,
+                        delivery_mode: AndroidTextureDeliveryMode::CpuCopyBridge,
+                        delivery_status:
+                            AndroidHardwareBufferDeliveryStatus::FlushOnMarkFrameAvailable,
+                    },
+                    InitialTextureAvailability::ReadyForFrameNotification,
+                ),
+                EngineTextureRegistrationRequest::AndroidHardwareBufferImport => (
+                    EngineTextureRegistrationDescriptor::AndroidHardwareBufferTexture {
+                        source_kind: AndroidHardwareBufferSourceKind::AHardwareBuffer,
+                        delivery_mode: AndroidTextureDeliveryMode::HardwareBufferImport,
+                        delivery_status:
+                            AndroidHardwareBufferDeliveryStatus::ReadyForConsumerImport,
+                    },
+                    InitialTextureAvailability::PendingBridge,
+                ),
+            };
+
+            Ok(RegisteredTextureInfo {
+                texture_id: TextureId::new(self.next_texture_id.fetch_add(1, Ordering::AcqRel)),
+                registration_descriptor,
+                availability,
+            })
+        }
+
+        fn unregister_texture(
+            &self,
+            _engine_handle: EngineHandle,
+            _texture_id: TextureId,
+        ) -> Result<(), ResourceError> {
+            Ok(())
+        }
+
+        fn unregister_engine(&self, _engine_handle: EngineHandle) -> Result<(), ResourceError> {
+            Ok(())
+        }
+
+        fn get_android_native_window_target(
+            &self,
+            _engine_handle: EngineHandle,
+            _texture_id: TextureId,
+        ) -> Result<Option<*mut c_void>, ResourceError> {
+            Ok(Some(self.native_window_target as *mut c_void))
+        }
+
+        fn mark_texture_frame_available(
+            &self,
+            _engine_handle: EngineHandle,
+            _texture_id: TextureId,
+        ) -> Result<(), ResourceError> {
+            self.mark_frame_available_count.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+    }
+
+    impl SmokePixelFallbackBridgeDriver {
+        fn new() -> Self {
+            Self {
+                call_count: AtomicUsize::new(0),
+                observed_targets: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl AndroidFrameBridgeDriver for SmokePixelFallbackBridgeDriver {
+        fn copy_to_native_window(
+            &self,
+            handle: PlatformHandle,
+            native_window: *mut c_void,
+        ) -> Result<(), ResourceError> {
+            self.call_count.fetch_add(1, Ordering::AcqRel);
+            self.observed_targets
+                .lock()
+                .expect("pixel fallback observed-targets mutex poisoned")
+                .push(native_window as usize);
+
+            match handle {
+                PlatformHandle::Raw { platform, .. } if platform == "android_pixel_buffer" => {
+                    Ok(())
+                }
+                _ => Err(ResourceError::InvalidHandle(
+                    "expected android_pixel_buffer handle for fallback bridge",
+                )),
+            }
         }
     }
 
@@ -1496,6 +1694,221 @@ mod android_smoke {
         ))
     }
 
+    pub fn run_android_downgrade_diagnostic(engine_handle: i64) -> Result<String, String> {
+        let _runtime = ensure_runtime();
+
+        let invalid_probe = run_invalid_ahb_allocation_probe()?;
+        let legacy_probe = run_legacy_ahb_cleanup_probe()?;
+        let fallback_probe = run_pixel_fallback_runtime_probe(engine_handle)?;
+
+        Ok(format!(
+            "p3_android_downgrade=PASS\n\n[Invalid AHB Allocation]\n{}\n\n[Legacy AHB Cleanup]\n{}\n\n[PixelData Fallback Runtime]\n{}",
+            invalid_probe,
+            legacy_probe,
+            fallback_probe,
+        ))
+    }
+
+    fn run_invalid_ahb_allocation_probe() -> Result<String, String> {
+        let mut desc = unsafe { std::mem::zeroed::<AHardwareBuffer_Desc>() };
+        desc.width = SMOKE_WIDTH as u32;
+        desc.height = SMOKE_HEIGHT as u32;
+        desc.layers = 1;
+        desc.format = 0;
+        desc.usage = (AHardwareBuffer_UsageFlags::AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN.0
+            | AHardwareBuffer_UsageFlags::AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN.0
+            | AHardwareBuffer_UsageFlags::AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE.0) as u64;
+
+        let mut buffer: *mut AHardwareBuffer = std::ptr::null_mut();
+        let status = unsafe { ndk_sys::AHardwareBuffer_allocate(&desc, &mut buffer) };
+        if status == 0 && !buffer.is_null() {
+            unsafe {
+                ndk_sys::AHardwareBuffer_release(buffer);
+            }
+            return Err(
+                "invalid AHardwareBuffer allocation unexpectedly succeeded for format=0"
+                    .to_string(),
+            );
+        }
+
+        Ok(format!(
+            "invalid_ahb_allocate=PASS\ninvalid_format=0\nallocate_status={}",
+            status,
+        ))
+    }
+
+    fn run_legacy_ahb_cleanup_probe() -> Result<String, String> {
+        let fd_before = current_fd_count().ok_or_else(|| {
+            "legacy downgrade cleanup probe could not enumerate /proc/self/fd before cleanup"
+                .to_string()
+        })?;
+        let cleaner = Arc::new(AndroidPlatformCleaner::new());
+        cleaner.mark_downgraded();
+        let ahb_ptr = unsafe { allocate_ahardware_buffer(SMOKE_WIDTH, SMOKE_HEIGHT) }
+            .map_err(|error| format!("legacy downgrade cleanup could not allocate AHB: {error}"))?;
+
+        let source = Arc::new(
+            SharedSource::new_with_deferred_drop(
+                SourceId::new(SMOKE_P3_LEGACY_AHB_SOURCE_ID),
+                unsafe { AndroidPlatformHandle::from_ahb(ahb_ptr, SMOKE_WIDTH, SMOKE_HEIGHT) }
+                    .into(),
+                SMOKE_SOURCE_BYTES,
+                cleaner.clone(),
+            )
+            .map_err(|error| format!("legacy downgrade cleanup could not create source: {error}"))?,
+        );
+
+        let release_outcome = source.release_shared_resources();
+        drop(source);
+        flush_platform_cleanup_callbacks(4);
+
+        let (fd_after_min, fd_after_last) = settled_fd_count(4, 2).ok_or_else(|| {
+            "legacy downgrade cleanup probe could not enumerate /proc/self/fd after cleanup"
+                .to_string()
+        })?;
+        let fd_delta_min = fd_after_min as isize - fd_before as isize;
+        let fd_delta_last = fd_after_last as isize - fd_before as isize;
+        if !cleaner.is_cleaned() || cleaner.state() != platform_android::AHBCleanupState::Cleaned {
+            return Err(format!(
+                "legacy downgrade cleanup did not reach Cleaned: state={:?}",
+                cleaner.state()
+            ));
+        }
+        if fd_delta_min > 0 {
+            return Err(format!(
+                "legacy downgrade cleanup left a sustained positive fd delta after release: fd_before={}, fd_after_min={}, fd_after_last={}, fd_delta_min={}, fd_delta_last={}",
+                fd_before,
+                fd_after_min,
+                fd_after_last,
+                fd_delta_min,
+                fd_delta_last,
+            ));
+        }
+
+        Ok(format!(
+            "legacy_ahb_cleanup=PASS\nrelease_outcome={:?}\ncleanup_state={:?}\nfd_before={}\nfd_after_min={}\nfd_after_last={}\nfd_delta_min={}\nfd_delta_last={}",
+            release_outcome,
+            cleaner.state(),
+            fd_before,
+            fd_after_min,
+            fd_after_last,
+            fd_delta_min,
+            fd_delta_last,
+        ))
+    }
+
+    fn run_pixel_fallback_runtime_probe(seed_engine_handle: i64) -> Result<String, String> {
+        let source_provider = Arc::new(AndroidPixelFallbackSourceProvider::new());
+        let registry_store = Arc::new(P3DiagnosticRegistryStore::new(0xF00Du64 as usize));
+        let bridge_driver = Arc::new(SmokePixelFallbackBridgeDriver::new());
+        let diagnostic_engine_handle = synthetic_engine_handle(seed_engine_handle, 10_003);
+        let diagnostic_api = Arc::new(
+            FfiApi::builder()
+                .with_source_provider(source_provider.clone())
+                .with_registry_store(registry_store.clone())
+                .with_android_frame_bridge(bridge_driver.clone())
+                .with_android_texture_registration_strategy(
+                    AndroidTextureRegistrationStrategy::HardwareBufferSeam,
+                )
+                .build(),
+        );
+
+        with_swapped_runtime(diagnostic_api.clone(), || {
+            let register = irondash_ffi_register_engine(diagnostic_engine_handle);
+            if !register.success {
+                return Err(format!(
+                    "pixel fallback runtime probe register_engine failed with error_code={}",
+                    register.error_code
+                ));
+            }
+
+            let acquire = irondash_ffi_acquire_shared_texture(
+                SMOKE_P3_DOWNGRADE_SOURCE_ID,
+                diagnostic_engine_handle,
+                FfiPriorityCode::Visible as u32,
+            );
+            if acquire.decision != FfiAcquireDecision::Accepted as u32 {
+                let _ = irondash_ffi_unregister_engine(diagnostic_engine_handle);
+                return Err(format!(
+                    "pixel fallback runtime probe expected accepted acquire, got decision={} error_code={}",
+                    acquire.decision,
+                    acquire.error_code,
+                ));
+            }
+
+            let initial_events = drain_event_records();
+            let processed = irondash_ffi_process_pending_requests(1);
+            let ready_events = drain_event_records();
+            let ready_state = request_state(acquire.request_id).ok_or_else(|| {
+                format!(
+                    "pixel fallback runtime probe could not read request state for request_id={}",
+                    acquire.request_id
+                )
+            })?;
+
+            let release = irondash_ffi_release_texture(acquire.request_id, diagnostic_engine_handle);
+            let release_events = drain_event_records();
+            let _ = irondash_ffi_unregister_engine(diagnostic_engine_handle);
+            let _ = drain_event_records();
+            flush_platform_cleanup_callbacks(4);
+
+            let metrics_after = diagnostic_api.runtime_metrics_snapshot();
+            let observed_requests = registry_store.observed_requests();
+            let cleaner_state = source_provider.last_cleaner_state().ok_or_else(|| {
+                "pixel fallback runtime probe did not record a platform cleaner".to_string()
+            })?;
+
+            if processed != 1
+                || observed_requests.as_slice() != [EngineTextureRegistrationRequest::Default]
+                || bridge_driver.call_count.load(Ordering::Acquire) != 1
+                || ready_state.status != FfiStatusCode::Ready as u32
+                || ready_state.texture_id < 0
+                || release.error_code != 0
+                || cleaner_state != platform_android::AHBCleanupState::Cleaned
+                || metrics_after.shared_source_count != 0
+                || metrics_after.request_inflight_count != 0
+                || registry_store
+                    .mark_frame_available_count
+                    .load(Ordering::Acquire)
+                    != 1
+                || !has_event_type(&ready_events, FfiEventType::TextureReady as u32)
+            {
+                return Err(format!(
+                    "pixel fallback runtime probe failed: processed={}, observed_requests={:?}, bridge_calls={}, ready_status={}, texture_id={}, release_error_code={}, cleaner_state={:?}, shared_source_count_after={}, inflight_after={}, mark_frame_available_count={}, initial_events={}, ready_events={}, release_events={}",
+                    processed,
+                    observed_requests,
+                    bridge_driver.call_count.load(Ordering::Acquire),
+                    ready_state.status,
+                    ready_state.texture_id,
+                    release.error_code,
+                    cleaner_state,
+                    metrics_after.shared_source_count,
+                    metrics_after.request_inflight_count,
+                    registry_store.mark_frame_available_count.load(Ordering::Acquire),
+                    format_event_records(&initial_events),
+                    format_event_records(&ready_events),
+                    format_event_records(&release_events),
+                ));
+            }
+
+            Ok(format!(
+                "pixel_fallback_runtime=PASS\nobserved_requests={:?}\nbridge_calls={}\nmark_frame_available_count={}\nfinal_status={} ({})\ntexture_id={}\ncleaner_state={:?}\nshared_source_count_after={}\ninflight_after={}\ninitial_events={}\nready_events={}\nrelease_events={}",
+                observed_requests,
+                bridge_driver.call_count.load(Ordering::Acquire),
+                registry_store.mark_frame_available_count.load(Ordering::Acquire),
+                ready_state.status,
+                status_name(ready_state.status),
+                ready_state.texture_id,
+                cleaner_state,
+                metrics_after.shared_source_count,
+                metrics_after.request_inflight_count,
+                format_event_records(&initial_events),
+                format_event_records(&ready_events),
+                format_event_records(&release_events),
+            ))
+        })
+    }
+
     fn run_rapid_cycle_stress(seed_engine_handle: i64) -> Result<String, String> {
         let registry_store = Arc::new(SmokeRecordingRegistryStore::default());
         let diagnostic_api = build_smoke_api_with_registry(
@@ -2548,6 +2961,23 @@ mod android_smoke {
         fs::read_dir("/proc/self/fd").ok().map(|entries| entries.count())
     }
 
+    fn settled_fd_count(samples: usize, cleanup_turns_per_sample: usize) -> Option<(usize, usize)> {
+        let mut min_count: Option<usize> = None;
+        let mut last_count: Option<usize> = None;
+
+        for _ in 0..samples.max(1) {
+            flush_platform_cleanup_callbacks(cleanup_turns_per_sample);
+            let count = current_fd_count()?;
+            min_count = Some(match min_count {
+                Some(current_min) => current_min.min(count),
+                None => count,
+            });
+            last_count = Some(count);
+        }
+
+        Some((min_count?, last_count?))
+    }
+
     fn flush_platform_cleanup_callbacks(turns: usize) {
         let run_loop = RunLoop::current();
         for _ in 0..turns {
@@ -3365,6 +3795,39 @@ pub extern "C" fn run_p2_stress_diagnostic_example(
         {
             let _ = engine_id;
             let _ = port.send("p2 stress diagnostic is Android-only".to_string());
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn run_android_downgrade_diagnostic_example(
+    engine_id: i64,
+    ffi_ptr: *mut c_void,
+    port: i64,
+) {
+    init_logging();
+    irondash_dart_ffi::irondash_init_ffi(ffi_ptr);
+
+    RunLoop::sender_for_main_thread().unwrap().send(move || {
+        let port = irondash_dart_ffi::DartPort::new(port);
+
+        #[cfg(target_os = "android")]
+        {
+            match android_smoke::run_android_downgrade_diagnostic(engine_id) {
+                Ok(message) => {
+                    let _ = port.send(message);
+                }
+                Err(err) => {
+                    error!("Android smoke P3 downgrade diagnostic failed: {}", err);
+                    let _ = port.send(format!("p3 android downgrade diagnostic failed: {}", err));
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = engine_id;
+            let _ = port.send("p3 android downgrade diagnostic is Android-only".to_string());
         }
     });
 }

@@ -202,6 +202,23 @@ Future<String> runP2StressDiagnostic(int engineHandle) async {
   return await port.first as String;
 }
 
+Future<String> runAndroidDowngradeDiagnostic(int engineHandle) async {
+  final dylib = _loadLibrary();
+  final function = dylib
+      .lookup<NativeFunction<Void Function(Int64, Pointer<Void>, Int64)>>(
+        'run_android_downgrade_diagnostic_example',
+      )
+      .asFunction<void Function(int, Pointer<Void>, int)>();
+
+  final port = ReceivePort();
+  function(
+    engineHandle,
+    NativeApi.initializeApiDLData,
+    port.sendPort.nativePort,
+  );
+  return await port.first as String;
+}
+
 Future<String> fetchSmokeSnapshot(int engineHandle) async {
   final dylib = _loadLibrary();
   final function = dylib
@@ -314,6 +331,7 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
   String _snapshot = '尚无 smoke snapshot';
   String _p1Report = '尚无 P1 诊断结果';
   String _p2Report = '尚无 P2 诊断结果';
+  String _p3Report = '尚无 P3 诊断结果';
 
   void _appendP1ReportSection(String title, String result) {
     final section = '[$title]\n$result';
@@ -327,6 +345,13 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
     _p2Report = _p2Report == '尚无 P2 诊断结果'
         ? section
         : '[$title]\n$result\n\n$_p2Report';
+  }
+
+  void _appendP3ReportSection(String title, String result) {
+    final section = '[$title]\n$result';
+    _p3Report = _p3Report == '尚无 P3 诊断结果'
+        ? section
+        : '[$title]\n$result\n\n$_p3Report';
   }
 
   Future<void> _runP1Diagnostic({
@@ -409,6 +434,51 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
       setState(() {
         _status = '$reportTitle 失败: $error';
         _appendP2ReportSection(reportTitle, '$reportTitle 失败: $error');
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _runP3Diagnostic({
+    required String statusLabel,
+    required String reportTitle,
+    required Future<String> Function(int engineHandle) invoke,
+    String? snapshotMessage,
+  }) async {
+    int? engineHandle;
+
+    setState(() {
+      _busy = true;
+      _status = statusLabel;
+    });
+
+    try {
+      engineHandle = _engineHandle ?? await EngineContext.instance.getEngineHandle();
+      final result = await invoke(engineHandle);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _engineHandle = engineHandle;
+        _textureId = null;
+        _status = '$reportTitle 已完成；详见下方报告';
+        if (snapshotMessage != null) {
+          _snapshot = snapshotMessage;
+        }
+        _appendP3ReportSection(reportTitle, result);
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _status = '$reportTitle 失败: $error';
+        _appendP3ReportSection(reportTitle, '$reportTitle 失败: $error');
       });
     } finally {
       if (mounted) {
@@ -655,6 +725,15 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
       reportTitle: 'P2 Stress Suite',
       invoke: runP2StressDiagnostic,
       snapshotMessage: 'P2 stress suite 使用 synthetic engine handles + mock registry store；需要时重新 Refresh Snapshot 或 Acquire 回到 live preview。',
+    );
+  }
+
+  Future<void> _runAndroidDowngradeDiagnostic() async {
+    await _runP3Diagnostic(
+      statusLabel: '正在运行 P3 Android downgrade 诊断（invalid AHB、legacy cleanup、PixelData fallback）',
+      reportTitle: 'P3 Android Downgrade',
+      invoke: runAndroidDowngradeDiagnostic,
+      snapshotMessage: 'P3 Android downgrade 诊断使用独立 runtime；需要时重新 Refresh Snapshot 或 Acquire 回到 baseline。',
     );
   }
 
@@ -1044,6 +1123,36 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
                 ),
               ),
             ),
+          if (widget.showHostLauncher) const SizedBox(height: 20),
+          if (widget.showHostLauncher)
+            Card.outlined(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'P3 Diagnostic Report',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      '这组诊断通过 host 按钮串联 invalid AHardwareBuffer allocation、downgraded AHB cleanup，以及 HardwareBufferSeam 自动回退到 PixelData bridge 的 runtime 证据。通过标准是报告中出现 p3_android_downgrade=PASS。',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                    const SizedBox(height: 12),
+                    SelectionArea(
+                      child: Text(
+                        _p3Report,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                              fontFamily: 'monospace',
+                            ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           const SizedBox(height: 20),
           Wrap(
             spacing: 12,
@@ -1108,6 +1217,11 @@ class _SmokeHomePageState extends State<SmokeHomePage> {
                 OutlinedButton(
                   onPressed: _busy ? null : _runP2StressDiagnostic,
                   child: const Text('Run P2 Stress Suite'),
+                ),
+              if (widget.showHostLauncher)
+                OutlinedButton(
+                  onPressed: _busy ? null : _runAndroidDowngradeDiagnostic,
+                  child: const Text('Run Android Downgrade (P3)'),
                 ),
             ],
           ),

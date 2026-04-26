@@ -97,6 +97,12 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 - Xiaomi 15 Ultra 上的首次 `Run P2 Stress Suite` 真机回放重新打开了问题：rapid cycle 报出 `fd_delta=400`，但同时 `active_textures_after=0`、`active_borrows_after=0`、`inflight_after=0`，说明更像是最终 FD 采样早于队列里的 platform cleanup callbacks 执行，而不是存活对象泄漏
 - `run_rapid_cycle_stress()` 现已在最终 `/proc/self/fd` 采样前显式 pump Android platform cleanup callbacks；修复后重新 clean rebuild、`adb install -r`、冷启动并再次点击 `Run P2 Stress Suite`，Xiaomi 15 Ultra 上的 `P2 Stress Report` 已回到 `p2_stress=PASS`，其中 `rapid_cycle=PASS`、`rss_growth_pct=0.81`、`fd_delta=-1`、`visibility_flicker=PASS`、`concurrent_multi_engine=PASS`，对应 UI 证据已落盘到 `code-base/progress/p2_stress_rerun_ui.xml`
 
+2026-04-26 P3 platform ownership 验证：
+
+- `cd /Volumes/VictorOutter/docs/DesignDocs/code-base/irondash/texture/example/rust && cargo check --target aarch64-linux-android` 持续通过；`cargo test --manifest-path /Volumes/VictorOutter/docs/DesignDocs/code-base/Cargo.toml -p texture-adapter test_binds_preserve_iosurface_single_retain_until_final_drop`、`cargo test --manifest-path /Volumes/VictorOutter/docs/DesignDocs/code-base/Cargo.toml -p ffi-api-boundary unregister_engine_with_pending_request_stops_followup_ready_events -- --exact`、`cargo test --manifest-path /Volumes/VictorOutter/docs/DesignDocs/code-base/Cargo.toml -p platform-android downgraded_cleanup_preserves_egl_then_ahb_order` 与 `cargo test --manifest-path /Volumes/VictorOutter/docs/DesignDocs/code-base/Cargo.toml -p platform-android pixel_fallback_cleanup_is_a_noop_but_completes` 均已通过。
+- fresh `flutter clean && flutter build apk --debug --android-skip-build-dependency-validation` + `adb install -r` 后，Xiaomi 15 Ultra 上点击 `Run Android Downgrade (P3)`，`code-base/progress/p3_android_rerun_after_tap.xml` 已记录 `p3_android_downgrade=PASS`。
+- 同一份报告同时记录 `invalid_ahb_allocate=PASS`、`legacy_ahb_cleanup=PASS`（`fd_delta_min=-1`、`fd_delta_last=-1`）和 `pixel_fallback_runtime=PASS`（`observed_requests=[Default]`、`bridge_calls=1`、`mark_frame_available_count=1`、`cleaner_state=Cleaned`、`shared_source_count_after=0`、`inflight_after=0`）。
+
 ## P2 收尾后的非阻塞跟踪
 
 这些项不会重新打开 P2；当前权威通过证据仍是 `code-base/progress/p2_stress_rerun_ui.xml`。
@@ -159,6 +165,17 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 
 注意：最后一项是宿主自诊断，不会在 UI 上额外打开第三个可见 panel；它证明的是“单次 resolve、多 engine 注册”这一条资源流，而不是复刻一个真实三窗口 Activity。
 
+## P3 Platform Ownership Diagnostics
+
+主页面现在还额外提供两个 P3 位点：
+
+- `P3 Diagnostic Report`：位于 `P2 Stress Report` 下方，用于累计显示 `Run Android Downgrade (P3)` 的结果。
+- `Run Android Downgrade (P3)`：当前会串联三条宿主级/平台级自诊断。
+- `invalid AHB allocation`：用 `format=0` 调 `AHardwareBuffer_allocate()`，证明 downgrade 入口可被稳定命中。
+- `legacy downgraded AHB cleanup`：创建真实 AHB source，标记 downgraded 后释放并等待 platform cleanup；要求 `cleanup_state=Cleaned`，且 settled `fd_delta_min` / `fd_delta_last` 不为正。
+- `PixelData fallback runtime`：用独立 runtime 验证 `HardwareBufferSeam` 在不合格 handle 上回退成 `Default`，bridge 恰好执行一次，`mark_frame_available_count=1`，release 后 `shared_source_count_after=0`、`inflight_after=0`。
+- `Companion focused tests`：`cargo test --manifest-path /Volumes/VictorOutter/docs/DesignDocs/code-base/Cargo.toml -p texture-adapter test_binds_preserve_iosurface_single_retain_until_final_drop` 与 `cargo test --manifest-path /Volumes/VictorOutter/docs/DesignDocs/code-base/Cargo.toml -p ffi-api-boundary unregister_engine_with_pending_request_stops_followup_ready_events -- --exact` 分别覆盖 iOS retain invariant 与 pending `EngineGone` cleanup。
+
 ## P0 多引擎手动验收
 
 推荐按下面顺序回放：
@@ -183,9 +200,9 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 后续如果改动落在 `ffi-api`、`engine-texture-registry`、Android seam/baseline 状态机，先跑下面这组最小回归，再决定要不要扩大范围：
 
 1. 先跑 `cd /Volumes/VictorOutter/docs/DesignDocs/code-base && cargo test -p ffi-api-boundary -- --nocapture`。
-2. 确认这组 focused tests 仍覆盖 `pause_request -> RequestPaused -> resume_request`、`duplicate acquire`、`release -> reacquire`、`cancel mid-flight` 无 stray ready、`cancel-after-ready no-op`、`release-before-ready` 的晚到 ready 丢弃、`engine gone` / pending request 清理、`bridge success/failure`、`fallback 保持 Registered` 语义；如果改动涉及 Android cleaner/shared-source 最终 release，再额外跑 `cargo test -p platform-android test_ahardwarebuffer_release_waits_for_final_release_boundary -- --nocapture`。
+2. 确认这组 focused tests 仍覆盖 `pause_request -> RequestPaused -> resume_request`、`duplicate acquire`、`release -> reacquire`、`cancel mid-flight` 无 stray ready、`cancel-after-ready no-op`、`release-before-ready` 的晚到 ready 丢弃、`engine gone` / pending request 清理、`bridge success/failure`、`fallback 保持 Registered` 语义；如果改动涉及 Android cleaner/shared-source 最终 release，再额外跑 `cargo test -p platform-android test_ahardwarebuffer_release_waits_for_final_release_boundary -- --nocapture`；如果改动涉及 iOS ownership 或 pending `EngineGone` cleanup，再额外跑 `cargo test -p texture-adapter test_binds_preserve_iosurface_single_retain_until_final_drop` 与 `cargo test -p ffi-api-boundary unregister_engine_with_pending_request_stops_followup_ready_events -- --exact`。
 3. 然后执行 `adb start-server && adb devices`，确认真机仍在线。
-4. 如果 Android target 可用，先用 `flutter run -d <android-device-id> --use-application-binary build/app/outputs/flutter-apk/app-debug.apk` 复用已验证 APK 重放单宿主 smoke，再点击一次 `Run P2 Stress Suite`，确认报告里出现 `rapid_cycle=PASS`、`visibility_flicker=PASS`、`concurrent_multi_engine=PASS`，并重新 `Refresh Snapshot` 或 `Acquire Smoke Texture` 确认 `Live Metrics` 仍会更新。
+4. 如果 Android target 可用，先用 `flutter run -d <android-device-id> --use-application-binary build/app/outputs/flutter-apk/app-debug.apk` 复用已验证 APK 重放单宿主 smoke，再点击一次 `Run P2 Stress Suite`，确认报告里出现 `rapid_cycle=PASS`、`visibility_flicker=PASS`、`concurrent_multi_engine=PASS`；如果改动触及 platform cleaner、fallback 选择、Rust host P3 诊断或按钮 wiring，再额外点击 `Run Android Downgrade (P3)`，确认报告里出现 `p3_android_downgrade=PASS`，并重新 `Refresh Snapshot` 或 `Acquire Smoke Texture` 确认 `Live Metrics` 仍会更新。
 5. 如果本轮改动触及 Dart snapshot / metrics UI，额外跑 `/Users/victor/fvm/versions/stable/bin/flutter analyze /Volumes/VictorOutter/docs/DesignDocs/code-base/irondash/texture/example/lib/main.dart`。
 6. 如果改动触及 Rust host / JNI 打包链，再执行 `flutter clean && flutter build apk --debug --android-skip-build-dependency-validation`。
 
@@ -221,6 +238,8 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 15. `Live Metrics` 面板可见，并且在 acquire / release / refresh 后会同步更新 `delivery_path`、timing、cache state、`texture_registrations` 与 `last_event`。
 16. 点击 `Run P2 Stress Suite` 后，`P2 Stress Report` 中出现 `rapid_cycle=PASS`、`visibility_flicker=PASS`、`concurrent_multi_engine=PASS`。
 17. `concurrent_multi_engine` 报告中能读到 `resolve_count_delta=1`、`texture_registrations_delta=3`，同时理解这项验证来自 synthetic engine handles + mock registry store，而不是页面上真的出现第三个可见 panel。
+18. 点击 `Run Android Downgrade (P3)` 后，`P3 Diagnostic Report` 中出现 `p3_android_downgrade=PASS`。
+19. 同一份 P3 报告中能读到 `invalid_ahb_allocate=PASS`、`legacy_ahb_cleanup=PASS` 和 `pixel_fallback_runtime=PASS`；其中 runtime 部分会包含 `observed_requests=[Default]`、`bridge_calls=1`、`cleaner_state=Cleaned`、`shared_source_count_after=0` 与 `inflight_after=0`。
 
 补充说明：`AHardwareBuffer_release` 的准确触发时序当前没有直接显示在 UI 报告里；这部分验收依赖 focused `platform-android` test，而不是 smoke host 文本输出。
 
@@ -235,4 +254,5 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 - 因此，release 后如果日志里没有紧跟 `EngineGone`，这是新的宿主预期；只有显式 reacquire 触发 best-effort teardown 时，才应该看到由 `unregister_engine` 带来的 engine-level 事件。
 - 随后的 `Acquire Smoke Texture` 会先消费这份待清理 session，再重新执行 `register_engine` 发起 acquire；这样 release 语义和 engine teardown 语义在 smoke host 里是分开的，但重新获取纹理仍然可用。
 - `Run P2 Stress Suite` 里的 concurrent multi-engine miss 目前使用 synthetic engine handles + mock registry store 做宿主自诊断；它验证的是真实资源流上的“单次 resolve、多次 registration”，不是当前 Activity 真正同时开出第三个 Flutter panel。
+- 以 `code-base/progress/smoke-host-upgrade.md` 的 gate 定义看，当前 P0-P3 upgrade 已完成；剩余只是非阻塞 hardening 和一个尚未在宿主级显式打到的 `assert_thread` failure-path probe，它们不会重新打开这轮 close-out。
 - 需要特别注意：irondash 当前的 Android hardware-buffer 实现仍会在 `mark_frame_available()` 期间把 retained `AHardwareBuffer` flush 到 engine-local `ANativeWindow`。因此“显式 AndroidHardwareBuffer 主路径已接通”不等于“GPU-direct / 无 copy 的最终 zero-copy 已完成”。
